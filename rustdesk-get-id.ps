@@ -1,0 +1,19 @@
+$Paths = @($Env:APPDATA, $Env:ProgramData, $Env:ALLUSERSPROFILE)
+
+foreach ($Path in $Paths) {
+If (Test-Path $Path\RustDesk\config) {
+$GoodPath = $Path
+}
+}
+
+$SystemFile = get-childitem -Path $GoodPath -Filter "RustDesk.toml" -Recurse -ErrorAction SilentlyContinue
+
+$ConfigPath = $SystemFile.FullName
+
+$ResultsIdSearch = Select-String -Path $ConfigPath -Pattern id
+
+$Result1 = @($ResultsIdSearch -split "= '")
+
+$Result = @($Result1 -split "'")
+
+$Result[1]
