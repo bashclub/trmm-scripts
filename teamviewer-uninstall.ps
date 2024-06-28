@@ -1,0 +1,25 @@
+
+# Script to uninstall TeamViewer
+
+
+
+
+# Function to uninstall TeamViewer using WMI
+
+function Uninstall-TeamViewerWMI {
+
+   $teamviewer = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "TeamViewer*" }
+
+   if ($teamviewer) {
+
+       $teamviewer.Uninstall()
+
+       Write-Output "TeamViewer has been uninstalled using WMI."
+
+       return $true
+
+   }
+
+   return $false
+
+}
