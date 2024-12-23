@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Aktualisiert die Paketlisten
+sudo apt-get update
+
+# Überprüft, ob upgradbare Pakete vorhanden sind
+upgradable=$(apt-get --just-print upgrade | grep "Inst" | wc -l)
+
+if [ "$upgradable" -eq 0 ]; then
+    echo "Keine neuen Updates verfügbar."
+    exit 0
+else
+    echo "Es sind neue Updates verfügbar."
+    exit 1
+fi

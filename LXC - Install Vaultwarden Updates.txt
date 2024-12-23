@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Dieses Skript führt das Update für Vaultwarden im angegebenen LXC-Container aus.
+# Es wird auf dem Proxmox-Server ausgeführt und stellt eine Verbindung zum LXC her, 
+# um das Update-Skript innerhalb des Containers auszuführen.
+
+# WICHTIG: Sie müssen die LXC-ID als Umgebungsvariable mitgeben!
+# Beispiel: LXC_ID=214
+# Diese Umgebungsvariable definiert, welcher LXC-Container das Update ausführt.
+
+# Exit-Codes
+# 0 - Update erfolgreich
+# 1 - Update fehlgeschlagen
+# 2 - Fehler (z. B. Container-ID fehlt)
+
+# Überprüfung, ob die Umgebungsvariable LXC_ID gesetzt ist
+if [[ -z "$LXC_ID" ]]; then
+    echo "Fehler: LXC_ID ist nicht gesetzt. Bitte die Container-ID als Umgebungsvariable angeben."
+    echo "Beispiel: LXC_ID=214 $0"
+    exit 2
+fi
+
+# Überprüfung, ob das Update-Skript existiert
+UPDATE_SCRIPT_PATH="/var/lib/vaultwarden/update.sh"
+
+if ! pct exec "$LXC_ID" -- test -f "$UPDATE_SCRIPT_PATH"; then
+    echo "Fehler: Update-Skript $UPDATE_SCRIPT_PATH existiert nicht im Container $LXC_ID."
+    exit 1
+fi
+
+# Update-Skript im LXC ausführen
+echo "Führe das Update für Vaultwarden im Container $LXC_ID aus..."
+pct exec "$LXC_ID" -- bash "$UPDATE_SCRIPT_PATH"
+
+# Überprüfung des Exit-Codes des Update-Skripts
+if [[ $? -eq 0 ]]; then
+    echo "Update erfolgreich im Container $LXC_ID abgeschlossen."
+    exit 0
+else
+    echo "Update fehlgeschlagen im Container $LXC_ID."
+    exit 1
+fi

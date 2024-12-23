@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Ausführen nur als Root
+if [[ $(id -u) -ne 0 ]]; then
+  echo "Dieses Skript muss als Root ausgeführt werden."
+  exit 1
+fi
+
+# Logdatei initialisieren
+log_file="lxc_updates_available.log"
+> "$log_file"
+
+# LXC-Container auflisten
+container_ids=$(lxc-ls --active)
+
+# Keine aktiven Container gefunden
+if [[ -z "$container_ids" ]]; then
+  echo "Keine aktiven LXC-Container gefunden."
+  exit 0
+fi
+
+# Für jeden Container Updates prüfen
+updates_found=0
+for id in $container_ids; do
+  # Hostname des Containers abrufen
+  hostname=$(lxc-attach -n $id -- hostname)
+  
+  # Update-Informationen abrufen und speichern
+  lxc-attach -n $id -- apt-get update > /dev/null
+  upgradable=$(lxc-attach -n $id -- apt-get -s upgrade)
+
+  # Überprüfen, ob Updates verfügbar sind
+  if echo "$upgradable" | grep -q "Inst "; then
+    echo "Neue Aktualisierungen für Container $id ($hostname) verfügbar"
+    echo "$id ($hostname)" >> "$log_file"
+    updates_found=1
+  else
+    echo "Keine Aktualisierungen für Container $id ($hostname) verfügbar"
+  fi
+done
+
+# Exit Code setzen basierend auf Update-Verfügbarkeit
+if [ "$updates_found" -eq 1 ]; then
+    # Logdatei löschen nach der Übermittlung
+    rm "$log_file"
+    exit 1001 # Custom Exit Code für "Updates verfügbar"
+else
+    # Logdatei löschen, wenn keine Updates verfügbar sind
+    rm "$log_file"
+    exit 0 # Erfolg, keine Updates verfügbar
+fi

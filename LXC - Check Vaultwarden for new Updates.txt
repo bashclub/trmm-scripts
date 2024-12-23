@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Dieses Skript prüft, ob ein Update für Vaultwarden im angegebenen LXC-Container verfügbar ist.
+# Es wird auf dem Proxmox-Server (PVE) ausgeführt und stellt eine Verbindung zum LXC her,
+# um das Check-Skript innerhalb des Containers auszuführen.
+
+# WICHTIG: Sie müssen die LXC-ID als Umgebungsvariable mitgeben!
+# Beispiel: LXC_ID=214
+# Diese Umgebungsvariable definiert, welcher LXC-Container geprüft wird.
+
+# Exit-Codes
+# 0 - Kein Update verfügbar
+# 1 - Update verfügbar
+# 2 - Fehler
+
+# Überprüfung, ob die Umgebungsvariable LXC_ID gesetzt ist
+if [[ -z "$LXC_ID" ]]; then
+    echo "Fehler: LXC_ID ist nicht gesetzt. Bitte die Container-ID als Umgebungsvariable angeben."
+    echo "Beispiel: LXC_ID=214 $0"
+    exit 2
+fi
+
+# Skript, das im LXC ausgeführt wird
+LXC_SCRIPT='
+#!/bin/bash
+
+# Funktion zum Abrufen der neuesten Tag-Version aus der Docker-Registry
+get_latest_version() {
+    curl -s "https://registry.hub.docker.com/v2/repositories/vaultwarden/server/tags/" \
+        | grep -oP "\"name\":\"\K\d+\.\d+\.\d+" | sort -V | tail -n 1
+}
+
+# Funktion zur Überprüfung der installierten Version
+get_installed_version() {
+    if [ -f /opt/vaultwarden/vaultwarden ]; then
+        /opt/vaultwarden/vaultwarden --version 2>/dev/null | grep -oP "\d+\.\d+\.\d+"
+    else
+        echo "unknown"
+    fi
+}
+
+# Check for required tools
+if ! command -v curl &> /dev/null; then
+    echo "Fehler: curl ist erforderlich, aber nicht installiert."
+    exit 2
+fi
+
+# Abrufen der Versionen
+LATEST_VERSION=$(get_latest_version)
+INSTALLED_VERSION=$(get_installed_version)
+
+if [[ -z "$LATEST_VERSION" ]]; then
+    echo "Fehler: Konnte die neueste Version nicht abrufen."
+    exit 2
+fi
+
+if [[ "$INSTALLED_VERSION" == "unknown" ]]; then
+    echo "Fehler: Vaultwarden scheint nicht installiert zu sein."
+    exit 2
+fi
+
+# Versionsvergleich
+if [[ "$LATEST_VERSION" != "$INSTALLED_VERSION" ]]; then
+    echo "Update verfügbar: Installiert ist v$INSTALLED_VERSION, neueste Version ist v$LATEST_VERSION."
+    exit 1
+else
+    echo "Vaultwarden ist aktuell: Version v$INSTALLED_VERSION."
+    exit 0
+fi
+'
+
+# Skript in den LXC ausführen
+RESULT=$(pct exec "$LXC_ID" -- bash -c "$LXC_SCRIPT")
+EXIT_CODE=$?
+
+# Ausgabe und Exit-Code weitergeben
+echo "$RESULT"
+exit $EXIT_CODE

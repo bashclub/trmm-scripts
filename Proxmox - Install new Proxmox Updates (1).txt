@@ -1,0 +1,30 @@
+#!/bin/bash
+
+LOGFILE="/var/log/apt_upgrade.log"
+KERNEL_PKG="linux-image"
+
+# Update-Prozess starten und in Logdatei schreiben
+sudo apt dist-upgrade -y > "$LOGFILE" 2>&1
+
+# Prüfe den Exit-Status von apt upgrade
+if [ $? -eq 0 ]; then
+    # Überprüfen, ob ein Neustart erforderlich ist
+    if [ -f /var/run/reboot-required ]; then
+        # Überprüfen, ob der Neustart aufgrund eines Kernel-Updates erforderlich ist
+        if grep -q "$KERNEL_PKG" "$LOGFILE"; then
+            echo "Neustart erforderlich! Alle Updates wurden erfolgreich aktualisiert."
+            exit 1
+        else
+            echo "Kein Neustart erforderlich! Alle Updates wurden erfolgreich installiert."
+            exit 0
+        fi
+    else
+        echo "Kein Neustart erforderlich! Alle Updates wurden erfolgreich installiert."
+        exit 0
+    fi
+else
+    # Fehler beim Update-Prozess
+    echo "Updateinstallation fehlgeschlagen: Siehe Logfile: $LOGFILE"
+    exit 2
+fi
+

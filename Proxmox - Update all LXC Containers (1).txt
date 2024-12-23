@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Ausführen nur als Root
+if [[ $(id -u) -ne 0 ]]; then
+  echo "Dieses Skript muss als Root ausgeführt werden."
+  exit 1
+fi
+
+# LXC-Container auflisten
+container_ids=$(lxc-ls --active)
+
+# Keine aktiven Container gefunden
+if [[ -z "$container_ids" ]]; then
+  echo "Keine aktiven LXC-Container gefunden."
+  exit 0
+fi
+
+reboot_required=0
+update_failed=0
+
+# Für jeden Container Updates durchführen
+for id in $container_ids; do
+  # Hostname des Containers abrufen
+  hostname=$(lxc-attach -n $id -- hostname)
+  
+  # Setzen der Umgebungsvariablen, um interaktive Eingaben zu vermeiden
+  lxc-attach -n $id -- env DEBIAN_FRONTEND=noninteractive apt-get update > /dev/null
+  if lxc-attach -n $id -- env DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y > /dev/null; then
+    echo "Container $id ($hostname) wurde erfolgreich aktualisiert."
+  else
+    echo "Bei der Aktualisierung von Container $id ($hostname) sind Fehler aufgetreten."
+    update_failed=1
+  fi
+
+  # Prüfen, ob ein Neustart erforderlich ist
+  if lxc-attach -n $id -- test -f /var/run/reboot-required; then
+    echo "Neustart von Container $id ($hostname) erforderlich."
+    reboot_required=1
+  else
+    echo "Kein Neustart von Container $id ($hostname) erforderlich."
+  fi
+done
+
+# Exit Code setzen basierend auf Fehler und Neustart-Bedarf
+if [ "$update_failed" -eq 1 ]; then
+    exit 1003 # Custom Exit Code für "Update fehlgeschlagen"
+elif [ "$reboot_required" -eq 1 ]; then
+    exit 1002 # Custom Exit Code für "Neustart erforderlich"
+else
+    exit 0 # Erfolg, kein Neustart erforderlich und keine Fehler
+fi
+
