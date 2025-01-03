@@ -21,15 +21,26 @@ fi
 
 # Für jeden Container Updates prüfen
 updates_found=0
+repository_errors=0
 for id in $container_ids; do
   # Hostname des Containers abrufen
   hostname=$(lxc-attach -n $id -- hostname)
   
   # Update-Informationen abrufen und speichern
-  lxc-attach -n $id -- apt-get update > /dev/null
-  upgradable=$(lxc-attach -n $id -- apt-get -s upgrade)
+  lxc-attach -n $id -- apt-get update 2>&1 | tee /tmp/${id}_update.log > /dev/null
+  
+  # Prüfen auf Repository-Fehler
+  if grep -qE "Fehlschlag beim Holen|GPG-Fehler|Einige Indexdateien konnten nicht heruntergeladen werden" /tmp/${id}_update.log; then
+    echo "Fehler beim Abrufen von Repository-Daten für Container $id ($hostname)."
+    repository_errors=1
+  fi
 
-  # Überprüfen, ob Updates verfügbar sind
+  # Veraltete Keyrings ignorieren
+  grep -vE "Key is stored in legacy trusted.gpg keyring" /tmp/${id}_update.log > /tmp/${id}_filtered.log
+
+  # Upgrade-Check
+  upgradable=$(lxc-attach -n $id -- apt-get -s upgrade)
+  
   if echo "$upgradable" | grep -q "Inst "; then
     echo "Neue Aktualisierungen für Container $id ($hostname) verfügbar"
     echo "$id ($hostname)" >> "$log_file"
@@ -37,15 +48,19 @@ for id in $container_ids; do
   else
     echo "Keine Aktualisierungen für Container $id ($hostname) verfügbar"
   fi
+
+  # Temporäre Logs löschen
+  rm -f /tmp/${id}_update.log /tmp/${id}_filtered.log
 done
 
-# Exit Code setzen basierend auf Update-Verfügbarkeit
-if [ "$updates_found" -eq 1 ]; then
-    # Logdatei löschen nach der Übermittlung
-    rm "$log_file"
-    exit 1001 # Custom Exit Code für "Updates verfügbar"
+# Exit-Code setzen basierend auf Fehlern und Update-Verfügbarkeit
+if [[ "$repository_errors" -eq 1 ]]; then
+  echo "Es gab Fehler bei Repository-Daten. Bitte prüfen."
+  exit 2
+elif [[ "$updates_found" -eq 1 ]]; then
+  echo "Updates verfügbar. Exit mit Fehler für Updates."
+  exit 1001
 else
-    # Logdatei löschen, wenn keine Updates verfügbar sind
-    rm "$log_file"
-    exit 0 # Erfolg, keine Updates verfügbar
+  echo "Alles aktuell, keine Updates oder Fehler."
+  exit 0
 fi
