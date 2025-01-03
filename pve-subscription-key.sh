@@ -2,6 +2,12 @@
 
 # Skript zur Überprüfung des Proxmox VE Subscription-Status
 
+# Überprüfen, ob das Kommando verfügbar ist
+if ! command -v pvesubscription &>/dev/null; then
+  echo "Das Kommando 'pvesubscription' ist nicht verfügbar. Bitte überprüfen Sie, ob Proxmox VE korrekt installiert ist.",exit >&2
+  exit 0
+fi
+
 # Befehl ausführen und Output erfassen
 OUTPUT=$(pvesubscription get 2>&1)
 
