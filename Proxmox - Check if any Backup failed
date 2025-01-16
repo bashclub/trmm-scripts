@@ -1,0 +1,23 @@
+#!/bin/bash
+
+log_directory="/var/log/vzdump/"
+success=true
+failed_vms=""
+
+for logfile in "$log_directory"*.log; do
+    if grep -q "ERROR" "$logfile"; then
+        vm_id=$(grep -oP "Starting Backup of VM \K\d+" "$logfile")
+        if [ -n "$vm_id" ]; then
+            success=false
+            failed_vms="$failed_vms VM $vm_id"
+        fi
+    fi
+done
+
+if [ "$success" = true ]; then
+    echo "All backups successful"
+    exit 0
+else
+    echo "Backup Fehlgeschlagen für $failed_vms Bitte Logfile unter /var/log/vzdump/ prüfen und das fehlerhafte log löschen "
+    exit 1
+fi
