@@ -1,0 +1,105 @@
+#!/bin/bash
+
+# Sicherstellen, dass das Skript als Root ausgeführt wird
+if [[ $(id -u) -ne 0 ]]; then
+  echo "Dieses Skript muss als Root ausgeführt werden."
+  exit 1
+fi
+
+# Logdatei initialisieren
+log_file="lxc_updates_available.log"
+> "$log_file"
+
+# LXC-Container auflisten
+container_ids=$(lxc-ls --active)
+
+# Falls keine aktiven Container gefunden wurden
+if [[ -z "$container_ids" ]]; then
+  echo "Keine aktiven LXC-Container gefunden."
+  exit 0
+fi
+
+# Statusvariablen
+updates_found=0
+repository_errors=0
+declare -a update_list
+declare -a no_update_list
+declare -a repo_error_list
+declare -a container_results
+
+# **Ergebnis-Zeile (wird später überschrieben, falls nötig)**
+result_line="Keine neuen LXC Updates verfügbar"
+
+# **Updates-Prüfung starten**
+for id in $container_ids; do
+  # **ECHTEN HOSTNAMEN AUS DEM LXC CONTAINER HOLEN**
+  hostname=$(lxc-attach -n "$id" -- hostname 2>/dev/null | tr -d '\r' | tr -d '\n')
+
+  # **Falls Hostname leer ist, als Notfall setzen**
+  if [[ -z "$hostname" ]]; then
+    hostname="Unbekannt-$id"
+  fi
+
+  # **Richtige LXC-IP-Adresse holen**
+  ip_address=$(lxc-attach -n "$id" -- ip -4 addr show scope global | awk '/inet / {print $2}' | cut -d'/' -f1 | head -n 1)
+
+  # Falls keine IP gefunden wurde, Fallback auf alte Methode
+  if [[ -z "$ip_address" ]]; then
+    ip_address=$(lxc-info -n "$id" -iH | head -n 1 | tr -d '\r')
+  fi
+
+  # `apt-get update` ausführen & Fehler checken
+  lxc-attach -n "$id" -- apt-get update &> /tmp/${id}_update.log
+
+  if grep -qE "Fehlschlag beim Holen|GPG-Fehler|Einige Indexdateien konnten nicht heruntergeladen werden" /tmp/${id}_update.log; then
+    repo_error_list+=("$id|$hostname|$ip_address")
+    repository_errors=1
+    status="🟡 Repository-Fehler"
+  else
+    upgradable=$(lxc-attach -n "$id" -- apt-get -s upgrade)
+    if echo "$upgradable" | grep -q "Inst "; then
+      update_list+=("$id|$hostname|$ip_address")
+      echo "$id|$hostname|$ip_address" >> "$log_file"
+      updates_found=1
+      status="🔴 Update verfügbar"
+      result_line="Neue Updates für LXC verfügbar!"
+    else
+      no_update_list+=("$id|$hostname|$ip_address")
+      status="🟢 Kein Update verfügbar"
+    fi
+  fi
+
+  # **Korrekte Daten für spätere Ausgabe speichern**
+  container_results+=("$id|$hostname|$ip_address|$status")
+
+  # Temporäre Logs löschen
+  rm -f /tmp/${id}_update.log
+done
+
+# **Ergebnis-Zeile als ersten Output setzen**
+echo -e "$result_line"
+
+# **Tabelle mit Container-Status anzeigen**
+echo "---------------------------------------------------------------"
+echo "🔎 Prüfe Updates für aktive LXC-Container"
+echo "---------------------------------------------------------------"
+printf "%-5s %-25s %-15s %-20s\n" "ID" "Hostname" "IP-Adresse" "Status"
+echo "---------------------------------------------------------------"
+
+# **Gespeicherte Container-Daten ausgeben**
+for result in "${container_results[@]}"; do
+  IFS='|' read -r id hostname ip status <<< "$result"
+  printf "%-5s %-25s %-15s %-20s\n" "$id" "$hostname" "$ip" "$status"
+done
+
+echo "---------------------------------------------------------------"
+
+# **Exit-Code setzen basierend auf Fehlern & Updates**
+if [[ "$repository_errors" -eq 1 ]]; then
+  exit 2
+elif [[ "$updates_found" -eq 1 ]]; then
+  exit 1001
+else
+  exit 0
+fi
+
