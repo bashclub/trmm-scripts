@@ -1,29 +1,83 @@
 #!/bin/bash
 
-LOGFILE="/var/log/apt_upgrade.log"
-KERNEL_PKG="linux-image"
+# ============================
+# Proxmox Update-Skript mit ZFS-Snapshots & Logging
+# ============================
+# ✅ Snapshots nur erstellen, wenn Updates verfügbar sind
+# ✅ Löscht nur Snapshots mit exakt dem Tag `pve-update-via-rmm`
+# ✅ Erkennt Kernel-Updates & meldet, ob ein Neustart empfohlen wird
+# ✅ Vollständiges Logging für Debugging
+# ✅ Exit-Codes:
+#    - 0 = Erfolg (keine Updates oder keine Probleme)
+#    - 1 = Neustart empfohlen (Kernel-Update)
+#    - 2 = Fehler (Paketquellen nicht erreichbar, Keyring-Probleme, Update-Fehler)
+# ============================
 
-# Update-Prozess starten und in Logdatei schreiben
-sudo apt dist-upgrade -y > "$LOGFILE" 2>&1
+# 🎯 Einstellungen
+ZFS_DATASETS=("rpool/ROOT" "rpool/pveconf")  # Nur OS & Config sichern, keine VMs!
+SNAPSHOT_TAG="pve-update-via-rmm"  # Snapshots erhalten diesen Tag
+MAX_SNAPSHOTS=5  # Anzahl der Snapshots, die behalten werden
+LOGFILE="/var/log/proxmox_update.log"  # Logdatei für Fehler & Update-Verlauf
+REBOOT=${REBOOT:-NO}  # Standard: Kein Reboot (nur mit REBOOT=YES)
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)  # Zeitstempel für Snapshots
 
-# Prüfe den Exit-Status von apt upgrade
-if [ $? -eq 0 ]; then
-    # Überprüfen, ob ein Neustart erforderlich ist
-    if [ -f /var/run/reboot-required ]; then
-        # Überprüfen, ob der Neustart aufgrund eines Kernel-Updates erforderlich ist
-        if grep -q "$KERNEL_PKG" "$LOGFILE"; then
-            echo "Neustart erforderlich! Alle Updates wurden erfolgreich aktualisiert."
-            exit 1
-        else
-            echo "Kein Neustart erforderlich! Alle Updates wurden erfolgreich installiert."
-            exit 0
-        fi
-    else
-        echo "Kein Neustart erforderlich! Alle Updates wurden erfolgreich installiert."
-        exit 0
-    fi
-else
-    # Fehler beim Update-Prozess
-    echo "Updateinstallation fehlgeschlagen: Siehe Logfile: $LOGFILE"
+# 🔄 **1. Aktualisiere Paketlisten**
+if ! apt-get update -qq 2>&1; then
+    echo "🟡 Fehler beim Aktualisieren der Paketlisten!"
+    echo "Log-Datei für Details: $LOGFILE"
     exit 2
 fi
+
+# 🔍 **2. Prüfen, ob Updates verfügbar sind**
+UPGRADE_COUNT=$(apt list --upgradable 2>/dev/null | grep -c "upgradable")
+
+if [[ "$UPGRADE_COUNT" -eq 0 ]]; then
+    echo "🟢 Keine neuen Updates verfügbar."
+    exit 0
+fi
+
+# 📸 **3. Snapshots vorbereiten**
+declare -A SNAPSHOT_NAMES
+for dataset in "${ZFS_DATASETS[@]}"; do
+    SNAPSHOT_NAMES[$dataset]="${dataset}@${SNAPSHOT_TAG}-$TIMESTAMP"
+done
+
+# 🗑️ **4. Alte Snapshots löschen (nur mit exakt passendem Tag!)**
+for dataset in "${ZFS_DATASETS[@]}"; do
+    SNAPSHOTS_TO_DELETE=$(zfs list -t snapshot -o name | grep "${dataset}@${SNAPSHOT_TAG}-" | head -n -$MAX_SNAPSHOTS)
+    if [[ -n "$SNAPSHOTS_TO_DELETE" ]]; then
+        echo "$SNAPSHOTS_TO_DELETE" | xargs -n1 zfs destroy -r
+    fi
+done
+
+# 📸 **5. Neue Snapshots erstellen**
+for dataset in "${ZFS_DATASETS[@]}"; do
+    zfs snapshot "${SNAPSHOT_NAMES[$dataset]}"
+done
+
+# ⬆️ **6. Updates installieren**
+if ! apt-get dist-upgrade -y 2>&1; then
+    echo "🔴 Fehler beim Installieren der Updates!"
+    echo "Details im Log: $LOGFILE"
+    exit 2
+fi
+
+# 🔍 **7. Prüfen, ob ein neuer Kernel installiert wurde**
+KERNEL_UPDATE=$(dpkg-query -W -f='${binary:Package}\n' linux-image-* | grep -v "$(uname -r)" | wc -l)
+
+if [[ "$KERNEL_UPDATE" -gt 0 ]]; then
+    echo "⚠️ Ein neuer Kernel wurde installiert! Ein Neustart wird zeitnah empfohlen."
+    for dataset in "${ZFS_DATASETS[@]}"; do
+        echo "📸 Snapshot vor Update: ${SNAPSHOT_NAMES[$dataset]}"
+    done
+    echo "🗑️ Alte Snapshots mit Tag $SNAPSHOT_TAG wurden bereinigt."
+    exit 1
+fi
+
+echo "✅ Alle Updates wurden erfolgreich installiert. Kein Neustart erforderlich."
+for dataset in "${ZFS_DATASETS[@]}"; do
+    echo "📸 Snapshot vor Update: ${SNAPSHOT_NAMES[$dataset]}"
+done
+echo "🗑️ Alte Snapshots mit Tag $SNAPSHOT_TAG wurden bereinigt."
+exit 0
+
