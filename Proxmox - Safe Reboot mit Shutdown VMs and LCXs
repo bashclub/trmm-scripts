@@ -1,0 +1,29 @@
+#!/bin/bash
+
+echo "Ermittle laufende VMs und Container..."
+
+# Laufende VMs abrufen
+running_vms=$(qm list | awk '$3 == "running" {print $1}')
+# Laufende LXC-Container abrufen
+running_cts=$(pct list | awk '$2 == "running" {print $1}')
+
+# Laufende VMs herunterfahren
+for vm in $running_vms; do
+    echo "Stoppe VM $vm..."
+    qm shutdown $vm
+done
+
+# Laufende LXC-Container herunterfahren
+for ct in $running_cts; do
+    echo "Stoppe LXC-Container $ct..."
+    pct shutdown $ct
+done
+
+# Warte, bis alle VMs und Container gestoppt sind
+echo "Warte auf vollständiges Herunterfahren..."
+while [[ -n $(qm list | awk '$3 == "running" {print $1}') || -n $(pct list | awk '$2 == "running" {print $1}') ]]; do
+    sleep 5
+done
+
+echo "Alle VMs und Container sind gestoppt. Starte Proxmox neu..."
+shutdown -r now
