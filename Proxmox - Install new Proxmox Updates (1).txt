@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Prüfen, ob der Bootloader systemd-boot ist
+if [ -d "/sys/firmware/efi" ] && bootctl is-installed &>/dev/null; then
+    echo "System bootet mit systemd-boot."
+else
+    echo "System bootet NICHT mit systemd-boot. Skript wird abgebrochen."
+    exit 1
+fi
+
 # ============================
 # Proxmox Update-Skript mit ZFS-Snapshots & Logging
 # ============================
