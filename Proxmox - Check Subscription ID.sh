@@ -1,33 +1,28 @@
 #!/bin/bash
 
 # Skript zur Überprüfung des Proxmox VE Subscription-Status
+# Ergebnis wird ins Custom Field "PVESubID" geschrieben (TRMM)
 
-# Überprüfung, ob der Ordner /etc/pve existiert
-if [[ -d "/etc/pve" ]]; then
-    echo "Proxmox VE erkannt. Skript wird fortgesetzt."
-else
-    echo "Dieses System ist kein Proxmox VE" >&2
-    exit 0
+# Nur auf Proxmox-Systemen sinnvoll
+if [[ ! -d "/etc/pve" ]]; then
+  echo "Nicht Proxmox"
+  exit 0
 fi
 
-
-# Befehl ausführen und Output erfassen
-OUTPUT=$(pvesubscription get 2>&1)
-
-# Überprüfen, ob der Befehl erfolgreich war
-if [[ $? -ne 0 ]]; then
-  echo "Fehler beim Ausführen von 'pvesubscription get':" >&2
-  echo "$OUTPUT" >&2
+# Versuche den Lizenz-Key zu holen
+if ! OUTPUT=$(pvesubscription get 2>&1); then
+  echo "Fehler: $OUTPUT"
   exit 1
 fi
 
-# Nur den Key aus der Ausgabe extrahieren
-KEY=$(echo "$OUTPUT" | grep -i '^key:' | awk '{print $2}')
+# Extrahiere den Key
+KEY=$(echo "$OUTPUT" | awk -F': ' '/^key:/ {print $2}')
 
+# Falls kein Key vorhanden, "Community" zurückgeben
 if [[ -z "$KEY" ]]; then
-  echo "Kein Key gefunden (Community-Version oder keine Lizenz)."
+  echo "Community"
 else
-  echo "Key: $KEY"
+  echo "$KEY"
 fi
 
 exit 0
