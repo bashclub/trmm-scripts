@@ -1,0 +1,295 @@
+# Windows-Version ermitteln
+$os = Get-WmiObject -Class Win32_OperatingSystem
+$caption = $os.Caption
+
+switch -Regex ($caption) {
+    "Windows 7"             { $osTag = "W7"; break }
+    "Windows 8"             { $osTag = "W8"; break }
+    "Windows 10"            { $osTag = "W10"; break }
+    "Windows 11"            { $osTag = "W11"; break }
+    "Windows Server 2012"   { $osTag = "W2012"; break }
+    "Windows Server 2016"   { $osTag = "W2016"; break }
+    "Windows Server 2019"   { $osTag = "W2019"; break }
+    "Windows Server 2022"   { $osTag = "W2022"; break }
+    "Windows Server 2025"   { $osTag = "W2025"; break }
+    default                 { $osTag = "W?" }
+}
+
+# Funktion zur Prüfung der Signatur-Aktualität (max. 3 Tage alt)
+function Test-SignatureAge {
+    param(
+        [DateTime]$SignatureDate,
+        [string]$AVName
+    )
+    
+    $maxAge = 3
+    $age = (Get-Date) - $SignatureDate
+    
+    if ($age.Days -gt $maxAge) {
+        $ageText = "$($age.Days) Tage alt"
+        Write-Output "${osTag}: AV Fehler Signaturen alt ${AVName}: ${ageText}"
+        return $false
+    }
+    return $true
+}
+
+# ==========================
+# Server-OS
+# ==========================
+if ($osTag -match "W2012|W2016|W2019|W2022|W2025") {
+    $avFound = @()
+    $signatureOK = $true
+
+    # Defender prüfen (falls Cmdlet vorhanden)
+    if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+        try {
+            $def = Get-MpComputerStatus
+            if ($def.AntivirusEnabled) {
+                # Signatur-Datum prüfen
+                if ($def.AntivirusSignatureLastUpdated) {
+                    $sigDate = $def.AntivirusSignatureLastUpdated
+                    $age = (Get-Date) - $sigDate
+                    
+                    if ($age.Days -gt 3) {
+                        $signatureOK = $false
+                        Write-Output "${osTag}: AV Fehler Signaturen alt Defender: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                    }
+                }
+                
+                if ($signatureOK) {
+                    Write-Output "${osTag}: AV okay Defender aktiv"
+                    exit 0
+                } else {
+                    exit 1
+                }
+            } else {
+                $avFound += "AV Fehler Defend deaktiviert"
+            }
+        } catch {
+            $avFound += "AV Fehler Check Defender"
+        }
+    }
+
+    # Installierte Programme durchsuchen
+    $paths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    foreach ($p in $paths) {
+        Get-ItemProperty -Path $p -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.DisplayName -match "Avira|Kaspersky|Sophos|Trend Micro|ESET|McAfee|Symantec|Bitdefender") {
+                $avFound += $_.DisplayName
+            }
+        }
+    }
+
+    if ($avFound.Count -gt 0) {
+        Write-Output "${osTag}: AV Okay -> $($avFound -join ', ')"
+        exit 0
+    } else {
+        Write-Output "${osTag}: AV Fehler nichts gefunden"
+        exit 1
+    }
+}
+
+# ==========================
+# Client-OS (W7–W11)
+# ==========================
+$foundActive = $false
+$avProducts = @()
+$signatureIssue = $false
+
+try {
+    $avProducts = Get-WmiObject -Namespace "root\SecurityCenter2" -Class "AntiVirusProduct" -ErrorAction Stop
+} catch {
+    try {
+        $avProducts = Get-WmiObject -Namespace "root\SecurityCenter" -Class "AntiVirusProduct" -ErrorAction Stop
+    } catch {
+        Write-Output "${osTag}: AV Fehler Namespace nicht verfügbar"
+        exit 1
+    }
+}
+
+if (-not $avProducts) {
+    Write-Output "${osTag}: AV Fehler, nichts installiert"
+    exit 1
+}
+
+foreach ($av in $avProducts) {
+    $name = $av.displayName
+    $state = $av.productState
+
+    $hex = "{0:X6}" -f $state
+    
+    # ProductState Decoder:
+    # Byte 2 (Position 2-3): Status (00=deaktiviert, 10=aktiviert, 11=snoozed)
+    # Byte 3 (Position 4-5): Signatur (00=aktuell, 10=veraltet)
+    $enabled = $hex.Substring(2,2)
+    $upToDate = $hex.Substring(4,2)
+    
+    # Prüfe ob AV aktiv ist (10 oder 11 = aktiviert)
+    if ($enabled -eq '10' -or $enabled -eq '11') {
+        $foundActive = $true
+        
+        # Signaturprüfung basierend auf AV-Typ
+        $sigChecked = $false
+        
+        # === Windows Defender ===
+        if ($name -match "Windows Defender|Microsoft Defender") {
+            if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+                try {
+                    $def = Get-MpComputerStatus
+                    if ($def.AntivirusSignatureLastUpdated) {
+                        $sigDate = $def.AntivirusSignatureLastUpdated
+                        $age = (Get-Date) - $sigDate
+                        
+                        if ($age.Days -gt 3) {
+                            Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                            $signatureIssue = $true
+                        } else {
+                            Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                        }
+                        $sigChecked = $true
+                    }
+                } catch {}
+            }
+        }
+        
+        # === Kaspersky ===
+        elseif ($name -match "Kaspersky") {
+            try {
+                $kasperskyPath = "HKLM:\SOFTWARE\KasperskyLab"
+                if (Test-Path $kasperskyPath) {
+                    $avpPath = Get-ChildItem -Path $kasperskyPath -Recurse -ErrorAction SilentlyContinue | 
+                               Where-Object { $_.Name -match "AVP" } | Select-Object -First 1
+                    
+                    if ($avpPath) {
+                        $bases = Get-ItemProperty -Path "$($avpPath.PSPath)\*" -ErrorAction SilentlyContinue | 
+                                 Where-Object { $_.BasesDate }
+                        
+                        if ($bases -and $bases.BasesDate) {
+                            $sigDate = [DateTime]::ParseExact($bases.BasesDate, "yyyy/MM/dd HH:mm:ss", $null)
+                            $age = (Get-Date) - $sigDate
+                            
+                            if ($age.Days -gt 3) {
+                                Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                                $signatureIssue = $true
+                            } else {
+                                Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                            }
+                            $sigChecked = $true
+                        }
+                    }
+                }
+            } catch {}
+        }
+        
+        # === ESET ===
+        elseif ($name -match "ESET") {
+            try {
+                $esetPath = "HKLM:\SOFTWARE\ESET\ESET Security\CurrentVersion\Info"
+                if (Test-Path $esetPath) {
+                    $info = Get-ItemProperty -Path $esetPath -ErrorAction SilentlyContinue
+                    if ($info.ScannerVersion) {
+                        $sigDate = [DateTime]::ParseExact($info.ScannerVersion.Split()[0], "yyyyMMdd", $null)
+                        $age = (Get-Date) - $sigDate
+                        
+                        if ($age.Days -gt 3) {
+                            Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                            $signatureIssue = $true
+                        } else {
+                            Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                        }
+                        $sigChecked = $true
+                    }
+                }
+            } catch {}
+        }
+        
+        # === Avira ===
+        elseif ($name -match "Avira") {
+            try {
+                $aviraPath = "HKLM:\SOFTWARE\Avira\Antivirus"
+                if (Test-Path $aviraPath) {
+                    $info = Get-ItemProperty -Path $aviraPath -ErrorAction SilentlyContinue
+                    if ($info.VdfDate) {
+                        $sigDate = [DateTime]::ParseExact($info.VdfDate, "yyyyMMdd", $null)
+                        $age = (Get-Date) - $sigDate
+                        
+                        if ($age.Days -gt 3) {
+                            Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                            $signatureIssue = $true
+                        } else {
+                            Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                        }
+                        $sigChecked = $true
+                    }
+                }
+            } catch {}
+        }
+        
+        # === Sophos ===
+        elseif ($name -match "Sophos") {
+            try {
+                # Sophos speichert Daten in verschiedenen Pfaden
+                $sophosPath = "HKLM:\SOFTWARE\Sophos\SAVService\Status"
+                if (Test-Path $sophosPath) {
+                    $status = Get-ItemProperty -Path $sophosPath -ErrorAction SilentlyContinue
+                    if ($status.VirusDataVersion) {
+                        # Format kann variieren, versuche verschiedene Formate
+                        try {
+                            $sigDate = [DateTime]::Parse($status.VirusDataVersion)
+                            $age = (Get-Date) - $sigDate
+                            
+                            if ($age.Days -gt 3) {
+                                Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                                $signatureIssue = $true
+                            } else {
+                                Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                            }
+                            $sigChecked = $true
+                        } catch {}
+                    }
+                }
+            } catch {}
+        }
+        
+        # === McAfee ===
+        elseif ($name -match "McAfee") {
+            try {
+                $mcafeePath = "HKLM:\SOFTWARE\McAfee\AVEngine"
+                if (Test-Path $mcafeePath) {
+                    $engine = Get-ItemProperty -Path $mcafeePath -ErrorAction SilentlyContinue
+                    if ($engine.AVDatDate) {
+                        $sigDate = [DateTime]::ParseExact($engine.AVDatDate, "yyyy/MM/dd", $null)
+                        $age = (Get-Date) - $sigDate
+                        
+                        if ($age.Days -gt 3) {
+                            Write-Output "${osTag}: AV Fehler Signaturen alt ${name}: $($age.Days) Tage ($($sigDate.ToString('dd.MM.yyyy')))"
+                            $signatureIssue = $true
+                        } else {
+                            Write-Output "${osTag}: AV Aktiv $name (Signaturen aktuell)"
+                        }
+                        $sigChecked = $true
+                    }
+                }
+            } catch {}
+        }
+        
+        # Wenn Signaturprüfung nicht möglich war
+        if (-not $sigChecked) {
+            Write-Output "${osTag}: AV Aktiv $name"
+        }
+    } else {
+        Write-Output "${osTag}: AV Fehler $name ist deaktiviert"
+    }
+}
+
+if (-not $foundActive) {
+    exit 1
+} elseif ($signatureIssue) {
+    exit 1
+} else {
+    exit 0
+}
