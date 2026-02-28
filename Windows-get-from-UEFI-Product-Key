@@ -1,0 +1,11 @@
+$sls = Get-CimInstance -ClassName SoftwareLicensingService
+$sls.OA3xOriginalProductKeyDescription
+$key = (Get-CimInstance -ClassName SoftwareLicensingService).OA3xOriginalProductKey
+
+if ([string]::IsNullOrWhiteSpace($key)) {
+    Write-Output "Kein Produktschlüssel im UEFI vorhanden."
+    exit 0
+} else {
+    Write-Output $key
+    exit 1
+}
