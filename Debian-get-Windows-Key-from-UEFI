@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# Liest die ACPI-Tabelle "MSDM" aus dem System aus.
+# In dieser Tabelle hinterlegen viele Hersteller den
+# im BIOS/UEFI gespeicherten Windows-OEM-Produktschlüssel.
+# Der Inhalt wird unverändert auf der Konsole ausgegeben.
+
+cat /sys/firmware/acpi/tables/MSDM
