@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Prüfen, ob der Bootloader systemd-boot ist
-if [ -d "/sys/firmware/efi" ] && bootctl is-installed &>/dev/null; then
+if [ -d "/sys/firmware/efi" ] && proxmox-boot-tool status 2>/dev/null | grep -q "System currently booted with uefi"; then
     echo "System bootet mit systemd-boot."
 else
     echo "System bootet NICHT mit systemd-boot. Skript wird abgebrochen."
