@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proxmox VE Login Banner - Norton Commander Style
-# Default: ANSI blue /etc/issue + /etc/motd
-# Options: --mono --no-issue --no-motd
+# Default: ANSI blue /etc/motd ONLY (no pre-login disclosure)
+# Options: --mono --issue --no-issue --no-motd
 set -euo pipefail
 if (( EUID != 0 )); then
     printf 'Bitte als root ausfuehren.\n' >&2
@@ -19,17 +19,24 @@ import subprocess
 import tempfile
 from datetime import datetime
 
+# Einheitliche APT-/CLI-Ausgaben auch bei deutscher System-Locale.
+os.environ['LC_ALL'] = 'C'
+
 parser = argparse.ArgumentParser(description='Proxmox VE Norton Commander Login Banner')
 parser.add_argument('--mono', action='store_true', help='ASCII ohne Farbe')
-parser.add_argument('--no-issue', action='store_true', help='/etc/issue nicht aktualisieren')
+issue_group = parser.add_mutually_exclusive_group()
+issue_group.add_argument('--issue', action='store_true',
+                         help='/etc/issue ausdruecklich zusaetzlich beschreiben')
+issue_group.add_argument('--no-issue', action='store_true',
+                         help='Kompatibilitaetsparameter: /etc/issue auslassen (Standard)')
 parser.add_argument('--no-motd', action='store_true', help='/etc/motd nicht aktualisieren')
 args = parser.parse_args()
-if args.no_issue and args.no_motd:
-    parser.error('Beide Ausgabeziele wurden deaktiviert')
-TARGETS = ([] if args.no_issue else ['/etc/issue']) + ([] if args.no_motd else ['/etc/motd'])
+TARGETS = ([] if args.no_motd else ['/etc/motd']) + (['/etc/issue'] if args.issue else [])
+if not TARGETS:
+    parser.error('Kein Ausgabeziel aktiv: fuer /etc/issue --issue angeben')
 WIDTH = 76
-# Reserve 4 display cells per row for the traffic-light indicator.
-TEXT_WIDTH = WIDTH - 4
+# No traffic-light glyphs: the full inner width is usable.
+TEXT_WIDTH = WIDTH
 RESET = '\033[0m'
 COLORS = {
     'normal': '\033[44;97m',
@@ -52,6 +59,8 @@ def run(command, timeout=8):
         return 124, ''
 
 def read_json(command, timeout=12):
+    # SMART kann bei Fehlerindikatoren einen Nonzero-Returncode liefern,
+    # aber trotzdem gueltige JSON-Daten zur Diagnose ausgeben.
     _, output = run(command, timeout)
     try:
         return json.loads(output)
@@ -120,6 +129,87 @@ if installed:
     except (OSError, subprocess.TimeoutExpired):
         pass
 kernel_status = 'UNKNOWN' if not latest else 'OK' if kernel == latest else f'REBOOT? -> {latest}'
+
+# Paketlisten werden nur aus dem vorhandenen APT-Cache gelesen;
+# es wird weder apt update ausgefuehrt noch etwas installiert.
+def pending_apt_updates():
+    if not shutil.which('apt'):
+        return None
+    rc, output = run(['apt', 'list', '--upgradable'], timeout=20)
+    if rc != 0:
+        return None
+    return sum(
+        1 for line in output.splitlines()
+        if re.search(r'\[upgradable from:', line, re.IGNORECASE)
+    )
+
+apt_updates = pending_apt_updates()
+apt_text = f'{apt_updates} Updates' if apt_updates is not None else 'n/a'
+apt_color = ('green' if apt_updates == 0 else
+             'orange' if apt_updates is not None else 'orange')
+
+# Letzten lokalen vzdump-Task aus der Proxmox-API lesen.
+# Status=stopped allein bedeutet NICHT erfolgreich: exitstatus pruefen.
+def last_vzdump():
+    _, node = run(['hostname', '-s'])
+    if not node:
+        node = host.split('.')[0]
+    path = f'/nodes/{node}/tasks'
+    tasks = None
+    for filter_args in (
+        ['--typefilter', 'vzdump'],
+        ['--type', 'vzdump'],
+        [],
+    ):
+        args = ['pvesh', 'get', path] + filter_args + [
+            '--limit', '500', '--output-format', 'json'
+        ]
+        response = read_json(args, timeout=15)
+        if isinstance(response, list):
+            tasks = [item for item in response
+                     if isinstance(item, dict) and item.get('type') == 'vzdump']
+            break
+
+    if tasks is None:
+        return 'Taskhistorie nicht erreichbar', 'orange'
+    if not tasks:
+        return 'kein lokaler vzdump-Lauf gefunden', 'orange'
+
+    task = max(tasks, key=lambda x: int(x.get('starttime') or 0))
+    upid = task.get('upid')
+    if upid:
+        detail = read_json([
+            'pvesh', 'get', f'{path}/{upid}/status',
+            '--output-format', 'json'
+        ], timeout=10)
+        if isinstance(detail, dict) and detail:
+            task = dict(task, **detail)
+
+    timestamp = task.get('endtime') or task.get('starttime')
+    try:
+        when = datetime.fromtimestamp(int(timestamp)).strftime('%d.%m. %H:%M')
+    except (TypeError, ValueError, OSError, OverflowError):
+        when = '?'
+
+    status = str(task.get('status') or '').strip()
+    exitstatus = task.get('exitstatus')
+    if status.lower() in ('running', 'active'):
+        return f'{when} RUNNING', 'orange'
+    if status.lower() in ('stopped', 'ok', 'error', 'failed'):
+        effective = str(exitstatus or status)
+        if effective.upper() == 'OK':
+            return f'{when} OK', 'green'
+        if effective.lower() == 'stopped':
+            return f'{when} Ergebnis unbekannt', 'orange'
+        # Lange Fehlertexte passen nicht in den 80-Spalten-Rahmen.
+        return f'{when} FEHLER: {effective[:55]}', 'red'
+    if str(exitstatus).upper() == 'OK':
+        return f'{when} OK', 'green'
+    if exitstatus:
+        return f'{when} FEHLER: {str(exitstatus)[:55]}', 'red'
+    return f'{when} Status unbekannt', 'orange'
+
+vzdump_text, vzdump_color = last_vzdump()
 
 # RAM: MemAvailable includes reclaimable cache
 mem = {}
@@ -321,20 +411,80 @@ if os.path.exists('/etc/pve/corosync.conf') or os.path.exists('/etc/corosync/cor
         cluster = (f"{values.get('Name','?')} | Nodes: {values.get('Nodes','?')} | "
                    f"Votes: {values.get('Total votes','?')}/{values.get('Expected votes','?')} | Quorum: {quorum}")
 
-# Ceph
+# Ceph - Statusdaten verschiedener Releases koennen unterschiedlich verschachtelt sein.
+# Fallback ueber ceph osd stat, dann ceph osd dump (gleiche Ceph-CLI-Credentials).
+def osd_counts(data):
+    if not isinstance(data, dict):
+        return None
+    queue = [data]
+    while queue:
+        obj = queue.pop(0)
+        if not isinstance(obj, dict):
+            continue
+        if all(key in obj for key in ('num_osds', 'num_up_osds', 'num_in_osds')):
+            try:
+                return tuple(int(obj[k]) for k in
+                             ('num_osds', 'num_up_osds', 'num_in_osds'))
+            except (TypeError, ValueError):
+                pass
+        for key in ('osdmap', 'osd_stat', 'osdmap_summary', 'osdmap_info'):
+            value = obj.get(key)
+            if isinstance(value, dict):
+                queue.append(value)
+    return None
+
+def osd_counts_from_dump(data):
+    result = osd_counts(data)
+    if result is not None:
+        return result
+    osds = data.get('osds') if isinstance(data, dict) else None
+    if not isinstance(osds, list):
+        return None
+    try:
+        return (len(osds),
+                sum(int(o.get('up', 0)) for o in osds),
+                sum(int(o.get('in', 0)) for o in osds))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
 ceph, ceph_details = 'nicht konfiguriert', ''
+ceph_osd_missing = False
 if os.path.exists('/etc/pve/ceph.conf') or os.path.exists('/etc/ceph/ceph.conf'):
     data = read_json(['ceph', 'status', '--format', 'json'], timeout=10)
-    if not data:
+    if not isinstance(data, dict) or not data:
         ceph = 'ERROR: Ceph nicht erreichbar'
     else:
-        hd = data.get('health') or {}
-        health = hd.get('status', 'UNKNOWN')
-        osd = (data.get('osdmap') or {}).get('osdmap') or {}
-        ceph = (f"{health} | OSD: {osd.get('num_up_osds','?')}/{osd.get('num_osds','?')} | "
-                f"IN: {osd.get('num_in_osds','?')} | MON: {len(data.get('quorum_names') or [])}")
+        health_data = data.get('health') or {}
+        health = health_data.get('status', 'UNKNOWN')
+        counts = osd_counts(data)
+        if counts is None:
+            counts = osd_counts(read_json(
+                ['ceph', 'osd', 'stat', '--format', 'json'], timeout=10
+            ))
+        if counts is None:
+            counts = osd_counts_from_dump(read_json(
+                ['ceph', 'osd', 'dump', '--format', 'json'], timeout=10
+            ))
+
+        if counts is None:
+            ceph_osd_missing = True
+            osd_display = 'OSD: ?/? | IN: ?'
+        else:
+            total, up, inside = counts
+            osd_display = f'OSD: {up}/{total} | IN: {inside}'
+
+        mons = data.get('quorum_names')
+        if isinstance(mons, list):
+            mon_count = len(mons)
+        else:
+            mon_count = len(data.get('quorum') or [])
+
+        ceph = f'{health} | {osd_display} | MON: {mon_count}'
         if health != 'HEALTH_OK':
-            ceph_details = ', '.join(list((hd.get('checks') or {}).keys())[:3])
+            ceph_details = ', '.join(list((health_data.get('checks') or {}).keys())[:3])
+        if ceph_osd_missing:
+            prefix = (ceph_details + ' | ') if ceph_details else ''
+            ceph_details = prefix + 'OSD-Daten nicht abrufbar (JSON/Rechte pruefen)'
 
 # Multipath
 multipath, multipath_details = None, ''
@@ -431,24 +581,63 @@ else:
     ups_lines = [('NUT nicht installiert', 'yellow')]
 
 # Checkmk spool local-check summary.
-# Only spool files whose first line is a <<<local>>> section are considered.
-# Inside those files count only non-empty local-check lines, excluding section
-# headers and comments. A check is OK only when the line starts with "0 ".
+# Checkmk interprets a leading integer in the filename as maximum age in
+# seconds since last modification (mtime), NOT the filesystem birth time.
+# Files past that deadline are ignored by the agent and deleted here.
+# Only ordinary regular files are removed; dotfiles and symlinks are ignored.
 def checkmk_local_summary(folder='/var/lib/check_mk_agent/spool'):
+    import stat
+    import time
+
     if not os.path.isdir(folder):
         return 0, 0, 0, 'Spool-Verzeichnis fehlt', 'yellow'
 
-    total, good, file_errors = 0, 0, 0
+    total, good, file_errors, deletion_errors = 0, 0, 0, 0
+    now = time.time()
+
     try:
         with os.scandir(folder) as entries:
-            files = sorted((entry.path for entry in entries
-                            if entry.is_file() and not entry.name.startswith('.')))
+            files = sorted(
+                (entry.name for entry in entries
+                 if not entry.name.startswith('.')
+                 and entry.is_file(follow_symlinks=False))
+            )
     except OSError:
         return 0, 0, 0, 'Spool-Verzeichnis nicht lesbar', 'red'
 
-    for filename in files:
+    for basename in files:
+        filename = os.path.join(folder, basename)
         try:
-            with open(filename, 'r', encoding='utf-8-sig', errors='replace') as file:
+            metadata = os.stat(filename, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+
+            # The Checkmk agent extracts the initial digits, e.g.:
+            #   90000_backup          -> valid for 90000 seconds
+            #   3900_hourly           -> valid for 3900 seconds
+            #   backup                -> no expiration
+            match = re.match(r'^(\d+)', basename)
+            if match:
+                max_age = int(match.group(1))
+                if now - metadata.st_mtime > max_age:
+                    # Avoid deleting files modified/replaced since the scan.
+                    latest = os.stat(filename, follow_symlinks=False)
+                    if not stat.S_ISREG(latest.st_mode):
+                        continue
+                    if (latest.st_ino != metadata.st_ino
+                            or latest.st_dev != metadata.st_dev
+                            or latest.st_mtime_ns != metadata.st_mtime_ns
+                            or time.time() - latest.st_mtime <= max_age):
+                        continue
+                    try:
+                        os.unlink(filename)
+                    except OSError:
+                        deletion_errors += 1
+                    # Expired checks are never counted, even if deletion fails.
+                    continue
+
+            with open(filename, 'r', encoding='utf-8-sig',
+                      errors='replace') as file:
                 first = file.readline().strip()
                 if not re.fullmatch(r'<<<local(?::[^>]*)?>>>', first):
                     continue
@@ -458,24 +647,31 @@ def checkmk_local_summary(folder='/var/lib/check_mk_agent/spool'):
                     if not line or line.startswith('#'):
                         continue
                     if line.startswith('<<<') and line.endswith('>>>'):
-                        in_local = bool(re.fullmatch(r'<<<local(?::[^>]*)?>>>', line))
+                        in_local = bool(re.fullmatch(
+                            r'<<<local(?::[^>]*)?>>>', line
+                        ))
                         continue
                     if not in_local:
                         continue
                     total += 1
                     if line.startswith('0 '):
                         good += 1
+
         except OSError:
             file_errors += 1
 
     failed = total - good
-    if total == 0 and file_errors == 0:
+    if total == 0 and not (file_errors or deletion_errors):
         return total, good, failed, 'Keine lokalen Spool-Checks', 'yellow'
 
     result = f'{good}/{total} checks OK'
     if file_errors:
         result += f' | {file_errors} Datei(en) nicht lesbar'
-    color = 'red' if failed >= 2 or file_errors else 'orange' if failed == 1 else 'green'
+    if deletion_errors:
+        result += f' | {deletion_errors} veraltete Datei(en) nicht loeschbar'
+
+    color = ('red' if failed >= 2 or file_errors or deletion_errors
+             else 'orange' if failed == 1 else 'green')
     return total, good, failed, result, color
 
 checkmk_total, checkmk_ok, checkmk_bad, checkmk_text, checkmk_color = checkmk_local_summary()
@@ -581,11 +777,9 @@ for disk in block.get('blockdevices', []):
 
 # Render input as colored text segments.
 ROWS = []
-def row(*parts, indicator=None):
+def row(*parts):
     segments = [part if isinstance(part, tuple) else seg(part) for part in parts]
-    # Worst visible condition determines the first traffic light in the row.
-    indicator = indicator or worst_color(*(color for _, color in segments))
-    ROWS.append(('row', segments, indicator))
+    ROWS.append(('row', segments))
 def section(title):
     ROWS.append(('section', clean(title)))
 def guests_row(label, guests):
@@ -598,14 +792,17 @@ def guests_row(label, guests):
         parts.append(seg('-', 'orange'))
     row(*parts)
 
-row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'), indicator='green')
+row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'))
 row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
 row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
-row('Kernel  : ', seg(kernel, 'white'), ' [', seg(kernel_status, 'green' if kernel_status == 'OK' else 'orange' if kernel_status == 'UNKNOWN' or kernel_status.startswith('REBOOT?') else 'red'), ']')
-row(f'Uptime  : {uptime} | Update: {now}')
+row('Kernel  : ', seg(kernel, 'white'), ' [',
+    seg(kernel_status, 'green' if kernel_status == 'OK' else 'orange'
+        if kernel_status == 'UNKNOWN' or kernel_status.startswith('REBOOT?') else 'red'),
+    ']  | APT: ', seg(apt_text, apt_color))
+row(f'Uptime  : {uptime}')
+row('Vzdump  : ', seg(vzdump_text, vzdump_color))
 row('Memory  : ', seg(mem_text, mem_color))
-row('CPUs    : ', seg(f'{cores} logische Kerne', 'white'))
-row('Load    : ', seg(load_text, load_color))
+row('CPUs    : ', seg(f'{cores} Kerne', 'white'), ' | Load: ', seg(load_text, load_color))
 
 section('PHYSICAL NETWORK INTERFACES')
 parts = [seg('NICs    : ')]
@@ -613,16 +810,20 @@ for i, (label, color) in enumerate(nics):
     if i:
         parts.append(seg(', '))
     parts.append(seg(label, color))
-row(*parts) if nics else row('NICs    : -', indicator='orange')
+row(*parts) if nics else row('NICs    : -')
 
 section('VIRTUAL MACHINES / CONTAINERS')
 guests_row('VMs', vms)
 guests_row('LXCs', lxcs)
 section('CLUSTER / CEPH / MULTIPATH')
-row('Cluster : ', seg(cluster, 'red' if 'ERROR' in cluster else 'green' if 'Quorum: OK' in cluster or cluster == 'Standalone' else 'orange'))
-row('Ceph    : ', seg(ceph, 'green' if 'HEALTH_OK' in ceph or ceph == 'nicht konfiguriert' else 'orange' if 'HEALTH_WARN' in ceph else 'red' if 'ERROR' in ceph or 'HEALTH_ERR' in ceph else 'orange'))
+row(
+    'Cluster : ',
+    seg(cluster, 'red' if 'ERROR' in cluster else 'green' if 'Quorum: OK' in cluster or cluster == 'Standalone' else 'orange'),
+    '   Ceph : ',
+    seg(ceph, 'orange' if ceph_osd_missing else 'green' if 'HEALTH_OK' in ceph or ceph == 'nicht konfiguriert' else 'orange' if 'HEALTH_WARN' in ceph else 'red' if 'ERROR' in ceph or 'HEALTH_ERR' in ceph else 'orange')
+)
 if ceph_details:
-    row('Ceph    : ', seg(ceph_details, 'red'))
+    row('Ceph    : ', seg(ceph_details, 'orange' if ceph_osd_missing else 'red'))
 if multipath is not None:
     row('MPath   : ', seg(multipath, 'red' if 'ERROR' in multipath else 'green'))
     if multipath_details:
@@ -635,23 +836,38 @@ for text, color in ups_lines:
 section('SPOOL CHECKS')
 row('Spool Checks: ', seg(checkmk_text, checkmk_color))
 
-section('DATASTORES / ZFS POOLS')
-row(seg(f"{'DATASTORES (FREE)':<37}", 'cyan'), seg('ZFS POOLS (USED)', 'cyan'), indicator='green')
-row(seg(f"{'NAME':<18} {'GiB':>8} {'FREE%':>6}    ", 'cyan'), seg(f"{'POOL':<13} {'STATE':<9} {'USED%':>5}", 'cyan'), indicator='green')
-if not storages and not zpools:
-    row('Keine Datastores/ZFS-Pools ermittelt', indicator='orange')
-for i in range(max(len(storages), len(zpools))):
-    parts = []
-    if i < len(storages):
-        name, free_gib, free_pc, color = storages[i]
-        parts.extend((seg(f'{pad(name,18)} '), seg(f'{free_gib:>8} {free_pc:>6}', color), seg('    ')))
-    else:
-        parts.append(seg(' ' * 37))
-    if i < len(zpools):
-        name, health, used, color = zpools[i]
-        parts.append(seg(pad(name, 13) + ' '))
-        parts.append(seg(f'{health:<9} {used:>5}', color))
-    row(*parts)
+# Datastores zweispaltig (max. 76 Zeichen Innenbreite).
+# Jede Spalte: Name (17), freie GiB (8), freie Prozent (6).
+section('DATASTORES (FREE)')
+STORAGE_COLUMN_WIDTH = 38
+
+def datastore_column(index):
+    if index >= len(storages):
+        return [seg(' ' * STORAGE_COLUMN_WIDTH)]
+
+    name, free_gib, free_pc, color = storages[index]
+    return [
+        seg(f'{pad(name, 17)} '),
+        seg(f'{free_gib:>8} {free_pc:>6}', color),
+        seg(' ' * 5)
+    ]
+
+head = f"{'NAME':<17} {'FREE GiB':>8} {'FREE%':>6}"
+row(seg(head.ljust(STORAGE_COLUMN_WIDTH), 'cyan'), seg(head, 'cyan'))
+
+if not storages:
+    row(seg('Keine Datastores ermittelt', 'orange'))
+else:
+    for i in range(0, len(storages), 2):
+        row(*datastore_column(i), *datastore_column(i + 1))
+
+# ZFS weiter kompakt als eigene Liste unter den Datastores.
+section('ZFS POOLS (USED)')
+row(seg(f"{'POOL':<24} {'STATE':<12} {'USED%':>6}", 'cyan'))
+if not zpools:
+    row('Keine ZFS-Pools ermittelt')
+for name, health, used, color in zpools:
+    row(seg(f'{pad(name, 24)} '), seg(f'{health:<12} {used:>6}', color))
 for item in zfs_jobs:
     row('ZFS JOB : ', seg(item, 'red'))
 for item in zfs_warnings:
@@ -665,15 +881,14 @@ for name, model, serial, wear, years, remain, health, color, wear_color in disks
         seg(f'{wear:>5}', wear_color),
         seg(f' {years:>5} {remain:>6} '),
         seg(f'{health:>7}', 'red' if health == 'BAD' else 'orange' if health == 'UNKNOWN' else 'green'),
-        indicator=color)
+        )
     if len(serial) > 17:
-        row(f'Full serial {name}: {serial}', indicator=color)
+        row(f'Full serial {name}: {serial}')
 if not disks:
     row(seg('Keine physischen Datentraeger erkannt', 'orange'))
-row(seg('LEFT-Y = Wearout-Hochrechnung (keine Ausfallprognose)', 'orange'))
 ROWS.append(('footer', f' {host} | Proxmox VE {version} | {now} '))
 
-# Wrap using a fixed number of terminal cells reserved for the indicator.
+# Wrap colored text without any status symbols.
 def wrap_segments(parts):
     lines, current, length = [], [], 0
     for text, color in parts:
@@ -698,52 +913,55 @@ def wrap_segments(parts):
         lines.append(current)
     return lines
 
-ICONS = {'green': '🟢', 'orange': '🟠', 'red': '🔴'}
-MONO_ICONS = {'green': '[G]', 'orange': '[!]', 'red': '[X]'}
-
 def render_ansi():
     output = []
     yellow, white, cyan = COLORS['yellow'], COLORS['white'], COLORS['cyan']
-    def border(left, middle, right):
-        output.append(yellow + left + middle * (WIDTH + 2) + right + RESET)
-    def content(parts, indicator='green'):
+
+    def border(left, fill, right):
+        output.append(yellow + left + fill * (WIDTH + 2) + right + RESET)
+
+    def content(parts):
         for wrapped in wrap_segments(parts):
             visible = sum(len(text) for text, _ in wrapped)
-            # Emoji traffic lights each occupy two terminal cells.
-            line = yellow + '║' + white + ' ' + ICONS[indicator] + ' '
+            line = yellow + '║' + white + ' '
             for text, color in wrapped:
                 line += COLORS.get(color, white) + text
-            # 4 reserved cells: emoji (2), space (1), extra padding (1).
-            output.append(line + white + ' ' * (WIDTH - 2 - visible) + yellow + '║' + RESET)
+            output.append(
+                line + white + ' ' * (WIDTH - visible) + ' '
+                + yellow + '║' + RESET
+            )
+
     border('╔', '═', '╗')
     for index, item in enumerate(ROWS):
         kind, value = item[:2]
-        indicator = item[2] if len(item) > 2 else 'green'
         if index == 1:
             border('╠', '═', '╣')
         if kind == 'section':
-            title = f' {value} '[:WIDTH + 2]
-            output.append(yellow + '╟' + '─' + cyan + title + yellow + '─' * max(0, WIDTH + 1 - len(title)) + '╢' + RESET)
+            title = f' {value} '[:WIDTH + 1]
+            output.append(
+                yellow + '╟' + '─' + cyan + title + yellow
+                + '─' * max(0, WIDTH + 1 - len(title)) + '╢' + RESET
+            )
         elif kind == 'row':
-            content(value, indicator)
+            content(value)
         elif kind == 'footer':
             border('╠', '═', '╣')
-            content([seg(value, 'yellow')], 'green')
+            content([seg(value, 'yellow')])
     border('╚', '═', '╝')
     return '\n'.join(output) + '\n'
+
 
 def render_mono():
     output = ['=' * (WIDTH + 4)]
     for item in ROWS:
         kind, value = item[:2]
-        indicator = item[2] if len(item) > 2 else 'green'
         if kind == 'section':
             output.extend(('', value.upper(), '-' * (WIDTH + 4)))
         elif kind == 'row':
             for wrapped in wrap_segments(value):
-                output.append(MONO_ICONS[indicator] + ' ' + ''.join(text for text, _ in wrapped))
+                output.append(''.join(text for text, _ in wrapped))
         elif kind == 'footer':
-            output.extend(('=' * (WIDTH + 4), '[G] ' + value))
+            output.extend(('=' * (WIDTH + 4), value))
     output.append('=' * (WIDTH + 4))
     return ('\n'.join(output) + '\n').encode('ascii', 'replace').decode('ascii')
 
