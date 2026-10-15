@@ -28,6 +28,8 @@ if args.no_issue and args.no_motd:
     parser.error('Beide Ausgabeziele wurden deaktiviert')
 TARGETS = ([] if args.no_issue else ['/etc/issue']) + ([] if args.no_motd else ['/etc/motd'])
 WIDTH = 76
+# Reserve 4 display cells per row for the traffic-light indicator.
+TEXT_WIDTH = WIDTH - 4
 RESET = '\033[0m'
 COLORS = {
     'normal': '\033[44;97m',
@@ -76,7 +78,25 @@ def seg(text, color='normal'):
     return clean(text), color
 
 def color_status(text):
-    return 'green' if text.upper() in ('OK', 'ONLINE', 'HEALTH_OK', 'ACTIVE', 'UP') else 'red'
+    t = text.upper()
+    if t in ('OK', 'ONLINE', 'HEALTH_OK', 'ACTIVE', 'UP'):
+        return 'green'
+    if t in ('UNKNOWN', 'WARN', 'WARNING', 'HEALTH_WARN'):
+        return 'orange'
+    return 'red'
+
+# Utilization thresholds, applied uniformly to used capacity, load and wear.
+# Where a percentage means FREE (RAM, datastores), first invert it.
+def utilization_color(used_pct):
+    if used_pct is None:
+        return 'orange'
+    return 'red' if used_pct >= 80 else 'orange' if used_pct >= 75 else 'green'
+
+def worst_color(*colors):
+    severity = {'normal': 0, 'white': 0, 'cyan': 0, 'green': 0,
+                'yellow': 1, 'orange': 1, 'red': 2}
+    result = max(('green', *colors), key=lambda c: severity.get(c, 0))
+    return 'orange' if result == 'yellow' else result
 
 # SYSTEM / KERNEL
 _, host = run(['hostname', '-f'])
@@ -117,17 +137,19 @@ mfree = mem.get('MemAvailable', mem.get('MemFree', 0))
 free_pct = mfree * 100 / mtotal if mtotal else None
 mem_text = (f'{mfree/1048576:.1f} / {mtotal/1048576:.1f} GiB frei '
             f'({free_pct:.1f}%)') if free_pct is not None else 'UNKNOWN'
-mem_color = ('green' if free_pct >= 20 else 'yellow' if free_pct >= 10 else 'red') if free_pct is not None else 'yellow'
+mem_color = utilization_color(100 - free_pct if free_pct is not None else None)
 
 # Load is normalized load average, not measured CPU utilization.
 cores = os.cpu_count() or 1
 try:
     la = os.getloadavg()
-    load_pct = [n / cores * 100 for n in la]
-    load_text = '  '.join(f'{label}: {n:.0f}%' for label, n in zip(('1m', '5m', '15m'), load_pct))
-    load_color = 'red' if max(load_pct) >= 100 else 'yellow' if max(load_pct) >= 75 else 'green'
+    load_text = '  '.join(
+        f"{f'{n:.1f}'.rstrip('0').rstrip('.').replace('.', ',')}/{cores}"
+        for n in la
+    )
+    load_color = utilization_color(max(la) * 100 / cores)
 except OSError:
-    load_text, load_color = 'UNKNOWN', 'yellow'
+    load_text, load_color = 'UNKNOWN', 'orange'
 
 # IP addresses; Linux bridges with host-facing LAN count as physical.
 VIRTUAL_PREFIXES = ('docker', 'br-', 'wg', 'tailscale', 'tun', 'tap', 'veth',
@@ -259,7 +281,7 @@ if rc == 0:
             pct = None
         free_gib = f'{available_kib/1048576:.1f}' if available_kib is not None else '?'
         free_pc = f'{pct:.0f}%' if pct is not None else '?'
-        color = 'red' if pct is not None and pct < 10 else 'yellow' if pct is not None and pct < 20 else 'green'
+        color = utilization_color(100 - pct if pct is not None else None)
         storages.append((fields[0], free_gib, free_pc, color))
 
 # ZFS: over 80% used is red; active scrub/resilver/trim also red.
@@ -272,7 +294,7 @@ if shutil.which('zpool'):
             continue
         name, health, used = fields[:3]
         usage = number(used)
-        color = 'red' if health != 'ONLINE' or (usage is not None and usage > 80) else 'green'
+        color = 'red' if health != 'ONLINE' else utilization_color(usage)
         zpools.append((name, health, used, color))
         rc, detail = run(['zpool', 'status', name], timeout=10)
         if rc != 0:
@@ -392,6 +414,14 @@ def read_ups(target):
         parts.append(f'Rest {runtime/60:.0f} min')
     if fields.get('ups.load'):
         parts.append(f"Last {fields['ups.load']}%")
+    # For UPS values, battery charge is a remaining percentage, while
+    # ups.load is a utilization percentage. Apply 75/80 consistently.
+    battery_charge = number(fields.get('battery.charge'))
+    ups_load = number(fields.get('ups.load'))
+    if battery_charge is not None:
+        color = worst_color(color, utilization_color(100 - battery_charge))
+    if ups_load is not None:
+        color = worst_color(color, utilization_color(ups_load))
     return ' | '.join(parts), color
 
 if shutil.which('upsc'):
@@ -399,6 +429,56 @@ if shutil.which('upsc'):
     ups_lines = [read_ups(target) for target in targets[:10]] if targets else [('Keine USV gefunden', 'yellow')]
 else:
     ups_lines = [('NUT nicht installiert', 'yellow')]
+
+# Checkmk spool local-check summary.
+# Only spool files whose first line is a <<<local>>> section are considered.
+# Inside those files count only non-empty local-check lines, excluding section
+# headers and comments. A check is OK only when the line starts with "0 ".
+def checkmk_local_summary(folder='/var/lib/check_mk_agent/spool'):
+    if not os.path.isdir(folder):
+        return 0, 0, 0, 'Spool-Verzeichnis fehlt', 'yellow'
+
+    total, good, file_errors = 0, 0, 0
+    try:
+        with os.scandir(folder) as entries:
+            files = sorted((entry.path for entry in entries
+                            if entry.is_file() and not entry.name.startswith('.')))
+    except OSError:
+        return 0, 0, 0, 'Spool-Verzeichnis nicht lesbar', 'red'
+
+    for filename in files:
+        try:
+            with open(filename, 'r', encoding='utf-8-sig', errors='replace') as file:
+                first = file.readline().strip()
+                if not re.fullmatch(r'<<<local(?::[^>]*)?>>>', first):
+                    continue
+                in_local = True
+                for raw in file:
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('<<<') and line.endswith('>>>'):
+                        in_local = bool(re.fullmatch(r'<<<local(?::[^>]*)?>>>', line))
+                        continue
+                    if not in_local:
+                        continue
+                    total += 1
+                    if line.startswith('0 '):
+                        good += 1
+        except OSError:
+            file_errors += 1
+
+    failed = total - good
+    if total == 0 and file_errors == 0:
+        return total, good, failed, 'Keine lokalen Spool-Checks', 'yellow'
+
+    result = f'{good}/{total} checks OK'
+    if file_errors:
+        result += f' | {file_errors} Datei(en) nicht lesbar'
+    color = 'red' if failed >= 2 or file_errors else 'orange' if failed == 1 else 'green'
+    return total, good, failed, result, color
+
+checkmk_total, checkmk_ok, checkmk_bad, checkmk_text, checkmk_color = checkmk_local_summary()
 
 # SMART / wearout / lifetime estimation
 # Lifetime estimate assumes the same wear-per-power-on-hour rate continues.
@@ -494,13 +574,18 @@ for disk in block.get('blockdevices', []):
     model = str(disk.get('model') or smart.get('model_name') or 'unknown').strip()
     serial = str(disk.get('serial') or smart.get('serial_number') or '-').strip()
     wear_text, years, remain, wear = smart_values(smart)
-    health, color = smart_health(smart, wear)
-    disks.append((name, model, serial, wear_text, years, remain, health, color))
+    health, health_color = smart_health(smart, wear)
+    wear_color = utilization_color(wear) if wear is not None else 'normal'
+    disk_color = worst_color(health_color, wear_color)
+    disks.append((name, model, serial, wear_text, years, remain, health, disk_color, wear_color))
 
 # Render input as colored text segments.
 ROWS = []
-def row(*parts):
-    ROWS.append(('row', [part if isinstance(part, tuple) else seg(part) for part in parts]))
+def row(*parts, indicator=None):
+    segments = [part if isinstance(part, tuple) else seg(part) for part in parts]
+    # Worst visible condition determines the first traffic light in the row.
+    indicator = indicator or worst_color(*(color for _, color in segments))
+    ROWS.append(('row', segments, indicator))
 def section(title):
     ROWS.append(('section', clean(title)))
 def guests_row(label, guests):
@@ -510,13 +595,13 @@ def guests_row(label, guests):
             parts.append(seg(', '))
         parts.append(seg(name, color))
     if not guests:
-        parts.append(seg('-'))
+        parts.append(seg('-', 'orange'))
     row(*parts)
 
-row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'))
+row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'), indicator='green')
 row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
 row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
-row('Kernel  : ', seg(kernel, 'white'), ' [', seg(kernel_status, 'green' if kernel_status == 'OK' else 'yellow' if kernel_status == 'UNKNOWN' else 'red'), ']')
+row('Kernel  : ', seg(kernel, 'white'), ' [', seg(kernel_status, 'green' if kernel_status == 'OK' else 'orange' if kernel_status == 'UNKNOWN' or kernel_status.startswith('REBOOT?') else 'red'), ']')
 row(f'Uptime  : {uptime} | Update: {now}')
 row('Memory  : ', seg(mem_text, mem_color))
 row('CPUs    : ', seg(f'{cores} logische Kerne', 'white'))
@@ -528,14 +613,14 @@ for i, (label, color) in enumerate(nics):
     if i:
         parts.append(seg(', '))
     parts.append(seg(label, color))
-row(*parts) if nics else row('NICs    : -')
+row(*parts) if nics else row('NICs    : -', indicator='orange')
 
 section('VIRTUAL MACHINES / CONTAINERS')
 guests_row('VMs', vms)
 guests_row('LXCs', lxcs)
 section('CLUSTER / CEPH / MULTIPATH')
-row('Cluster : ', seg(cluster, 'red' if 'ERROR' in cluster else 'green' if 'Quorum: OK' in cluster else 'white'))
-row('Ceph    : ', seg(ceph, 'green' if 'HEALTH_OK' in ceph else 'yellow' if 'HEALTH_WARN' in ceph else 'red' if 'ERROR' in ceph or 'HEALTH_ERR' in ceph else 'white'))
+row('Cluster : ', seg(cluster, 'red' if 'ERROR' in cluster else 'green' if 'Quorum: OK' in cluster or cluster == 'Standalone' else 'orange'))
+row('Ceph    : ', seg(ceph, 'green' if 'HEALTH_OK' in ceph or ceph == 'nicht konfiguriert' else 'orange' if 'HEALTH_WARN' in ceph else 'red' if 'ERROR' in ceph or 'HEALTH_ERR' in ceph else 'orange'))
 if ceph_details:
     row('Ceph    : ', seg(ceph_details, 'red'))
 if multipath is not None:
@@ -547,10 +632,15 @@ section('UPS / NUT')
 for text, color in ups_lines:
     row('UPS     : ', seg(text, color))
 
+section('SPOOL CHECKS')
+row('Spool Checks: ', seg(checkmk_text, checkmk_color))
+
 section('DATASTORES / ZFS POOLS')
-row(seg(f"{'DATASTORES (FREE)':<37}", 'cyan'), seg('ZFS POOLS (USED)', 'cyan'))
-row(seg(f"{'NAME':<18} {'GiB':>8} {'FREE%':>6}    ", 'cyan'), seg(f"{'POOL':<13} {'STATE':<9} {'USED%':>5}", 'cyan'))
-for i in range(max(len(storages), len(zpools), 1)):
+row(seg(f"{'DATASTORES (FREE)':<37}", 'cyan'), seg('ZFS POOLS (USED)', 'cyan'), indicator='green')
+row(seg(f"{'NAME':<18} {'GiB':>8} {'FREE%':>6}    ", 'cyan'), seg(f"{'POOL':<13} {'STATE':<9} {'USED%':>5}", 'cyan'), indicator='green')
+if not storages and not zpools:
+    row('Keine Datastores/ZFS-Pools ermittelt', indicator='orange')
+for i in range(max(len(storages), len(zpools))):
     parts = []
     if i < len(storages):
         name, free_gib, free_pc, color = storages[i]
@@ -569,32 +659,35 @@ for item in zfs_warnings:
 
 section('PHYSICAL DISKS / SMART / ENDURANCE EST.')
 row(seg(f"{'DEVICE':<8} {'MODEL':<15} {'SERIAL':<17} {'WEAR':>5} {'ON-Y':>5} {'LEFT-Y':>6} {'SMART':>7}", 'cyan'))
-for name, model, serial, wear, years, remain, health, color in disks:
+for name, model, serial, wear, years, remain, health, color, wear_color in disks:
     row(seg(pad(name, 8), color),
-        seg(f' {pad(model,15)} {pad(serial,17)} {wear:>5} {years:>5} {remain:>6} '),
-        seg(f'{health:>7}', color))
+        seg(f' {pad(model,15)} {pad(serial,17)} '),
+        seg(f'{wear:>5}', wear_color),
+        seg(f' {years:>5} {remain:>6} '),
+        seg(f'{health:>7}', 'red' if health == 'BAD' else 'orange' if health == 'UNKNOWN' else 'green'),
+        indicator=color)
     if len(serial) > 17:
-        row(f'  Full serial {name}: {serial}')
+        row(f'Full serial {name}: {serial}', indicator=color)
 if not disks:
-    row(seg('Keine physischen Datentraeger erkannt', 'yellow'))
-row(seg('LEFT-Y = Wearout-Hochrechnung (keine Ausfallprognose)', 'yellow'))
+    row(seg('Keine physischen Datentraeger erkannt', 'orange'))
+row(seg('LEFT-Y = Wearout-Hochrechnung (keine Ausfallprognose)', 'orange'))
 ROWS.append(('footer', f' {host} | Proxmox VE {version} | {now} '))
 
-# Split segments by visible characters, leaving color groups intact.
+# Wrap using a fixed number of terminal cells reserved for the indicator.
 def wrap_segments(parts):
     lines, current, length = [], [], 0
     for text, color in parts:
         while text:
-            space = WIDTH - length
-            if space == 0:
+            space = TEXT_WIDTH - length
+            if space <= 0:
                 lines.append(current)
                 current, length = [], 0
-                space = WIDTH
+                space = TEXT_WIDTH
             if len(text) <= space:
                 current.append((text, color))
                 length += len(text)
                 break
-            if length and len(text) <= WIDTH:
+            if length and len(text) <= TEXT_WIDTH:
                 lines.append(current)
                 current, length = [], 0
                 continue
@@ -605,43 +698,52 @@ def wrap_segments(parts):
         lines.append(current)
     return lines
 
+ICONS = {'green': '🟢', 'orange': '🟠', 'red': '🔴'}
+MONO_ICONS = {'green': '[G]', 'orange': '[!]', 'red': '[X]'}
+
 def render_ansi():
     output = []
     yellow, white, cyan = COLORS['yellow'], COLORS['white'], COLORS['cyan']
     def border(left, middle, right):
         output.append(yellow + left + middle * (WIDTH + 2) + right + RESET)
-    def content(parts):
+    def content(parts, indicator='green'):
         for wrapped in wrap_segments(parts):
             visible = sum(len(text) for text, _ in wrapped)
-            line = yellow + '║' + white + ' '
+            # Emoji traffic lights each occupy two terminal cells.
+            line = yellow + '║' + white + ' ' + ICONS[indicator] + ' '
             for text, color in wrapped:
                 line += COLORS.get(color, white) + text
-            output.append(line + white + ' ' * (WIDTH - visible + 1) + yellow + '║' + RESET)
+            # 4 reserved cells: emoji (2), space (1), extra padding (1).
+            output.append(line + white + ' ' * (WIDTH - 2 - visible) + yellow + '║' + RESET)
     border('╔', '═', '╗')
-    for index, (kind, value) in enumerate(ROWS):
+    for index, item in enumerate(ROWS):
+        kind, value = item[:2]
+        indicator = item[2] if len(item) > 2 else 'green'
         if index == 1:
             border('╠', '═', '╣')
         if kind == 'section':
             title = f' {value} '[:WIDTH + 2]
             output.append(yellow + '╟' + '─' + cyan + title + yellow + '─' * max(0, WIDTH + 1 - len(title)) + '╢' + RESET)
         elif kind == 'row':
-            content(value)
+            content(value, indicator)
         elif kind == 'footer':
             border('╠', '═', '╣')
-            content([seg(value, 'yellow')])
+            content([seg(value, 'yellow')], 'green')
     border('╚', '═', '╝')
     return '\n'.join(output) + '\n'
 
 def render_mono():
     output = ['=' * (WIDTH + 4)]
-    for kind, value in ROWS:
+    for item in ROWS:
+        kind, value = item[:2]
+        indicator = item[2] if len(item) > 2 else 'green'
         if kind == 'section':
             output.extend(('', value.upper(), '-' * (WIDTH + 4)))
         elif kind == 'row':
             for wrapped in wrap_segments(value):
-                output.append(''.join(text for text, _ in wrapped))
+                output.append(MONO_ICONS[indicator] + ' ' + ''.join(text for text, _ in wrapped))
         elif kind == 'footer':
-            output.extend(('=' * (WIDTH + 4), value))
+            output.extend(('=' * (WIDTH + 4), '[G] ' + value))
     output.append('=' * (WIDTH + 4))
     return ('\n'.join(output) + '\n').encode('ascii', 'replace').decode('ascii')
 
