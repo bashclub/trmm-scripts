@@ -643,12 +643,15 @@ def checkmk_local_summary(folder='/var/lib/check_mk_agent/spool'):
                     continue
                 in_local = True
                 for raw in file:
-                    line = raw.strip()
-                    if not line or line.startswith('#'):
+                    # Bei der Statuspruefung gilt exakt der Zeilenanfang:
+                    # Nur '0 ' in Spalte 1 ist OK; ' 0 ' ist NICHT OK.
+                    line = raw.rstrip('\r\n')
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith('#'):
                         continue
-                    if line.startswith('<<<') and line.endswith('>>>'):
+                    if stripped.startswith('<<<') and stripped.endswith('>>>'):
                         in_local = bool(re.fullmatch(
-                            r'<<<local(?::[^>]*)?>>>', line
+                            r'<<<local(?::[^>]*)?>>>', stripped
                         ))
                         continue
                     if not in_local:
@@ -773,7 +776,9 @@ for disk in block.get('blockdevices', []):
     health, health_color = smart_health(smart, wear)
     wear_color = utilization_color(wear) if wear is not None else 'normal'
     disk_color = worst_color(health_color, wear_color)
-    disks.append((name, model, serial, wear_text, years, remain, health, disk_color, wear_color))
+    # Modellfarbe zeigt ausschliesslich den SMART-Zustand (OK/WARN/BAD).
+    # Verschleiss wird separat am Wearout-Prozentwert eingefaerbt.
+    disks.append((model, serial, wear_text, years, remain, health_color, wear_color))
 
 # Render input as colored text segments.
 ROWS = []
@@ -836,30 +841,54 @@ for text, color in ups_lines:
 section('SPOOL CHECKS')
 row('Spool Checks: ', seg(checkmk_text, checkmk_color))
 
-# Datastores zweispaltig (max. 76 Zeichen Innenbreite).
-# Jede Spalte: Name (17), freie GiB (8), freie Prozent (6).
-section('DATASTORES (FREE)')
-STORAGE_COLUMN_WIDTH = 38
+# Datastores: zwei Spalten, kompletter Name + freier Prozentwert.
+# 2 x 38 Zeichen = 76 Zeichen Innenbreite. Sehr lange Namen werden
+# innerhalb IHRER Spalte umgebrochen, niemals mit ~ abgekuerzt.
+section('DATASTORES (FREE%)')
+STORAGE_COLUMN_GAP = 2
+STORAGE_COLUMN_WIDTH = (TEXT_WIDTH - STORAGE_COLUMN_GAP) // 2
+STORAGE_PERCENT_WIDTH = 5
+STORAGE_NAME_WIDTH = STORAGE_COLUMN_WIDTH - STORAGE_PERCENT_WIDTH - 1
 
-def datastore_column(index):
+
+def datastore_cell(index):
     if index >= len(storages):
-        return [seg(' ' * STORAGE_COLUMN_WIDTH)]
+        return []
 
-    name, free_gib, free_pc, color = storages[index]
-    return [
-        seg(f'{pad(name, 17)} '),
-        seg(f'{free_gib:>8} {free_pc:>6}', color),
-        seg(' ' * 5)
-    ]
+    name, _free_gib, free_pc, color = storages[index]
+    name = clean(name)
+    chunks = [
+        name[j:j + STORAGE_NAME_WIDTH]
+        for j in range(0, len(name), STORAGE_NAME_WIDTH)
+    ] or ['']
 
-head = f"{'NAME':<17} {'FREE GiB':>8} {'FREE%':>6}"
-row(seg(head.ljust(STORAGE_COLUMN_WIDTH), 'cyan'), seg(head, 'cyan'))
+    # Der Prozentwert steht in der letzten Zeile der betreffenden Zelle.
+    # Alle Teilzeilen haben exakt STORAGE_COLUMN_WIDTH Zeichen.
+    result = []
+    for j, chunk in enumerate(chunks):
+        percentage = free_pc if j == len(chunks) - 1 else ''
+        result.append([
+            seg(f'{chunk:<{STORAGE_NAME_WIDTH}} '),
+            seg(f'{percentage:>{STORAGE_PERCENT_WIDTH}}', color),
+        ])
+    return result
+
+
+header = f'{"NAME":<{STORAGE_NAME_WIDTH}} {"FREE%":>{STORAGE_PERCENT_WIDTH}}'
+row(seg(header, 'cyan'), seg(' ' * STORAGE_COLUMN_GAP), seg(header, 'cyan'))
 
 if not storages:
     row(seg('Keine Datastores ermittelt', 'orange'))
 else:
     for i in range(0, len(storages), 2):
-        row(*datastore_column(i), *datastore_column(i + 1))
+        left = datastore_cell(i)
+        right = datastore_cell(i + 1)
+        for j in range(max(len(left), len(right))):
+            left_part = (left[j] if j < len(left)
+                         else [seg(' ' * STORAGE_COLUMN_WIDTH)])
+            right_part = (right[j] if j < len(right)
+                          else [seg(' ' * STORAGE_COLUMN_WIDTH)])
+            row(*(left_part + [seg(' ' * STORAGE_COLUMN_GAP)] + right_part))
 
 # ZFS weiter kompakt als eigene Liste unter den Datastores.
 section('ZFS POOLS (USED)')
@@ -874,16 +903,19 @@ for item in zfs_warnings:
     row('ZFS WARN: ', seg(item, 'red'))
 
 section('PHYSICAL DISKS / SMART / ENDURANCE EST.')
-row(seg(f"{'DEVICE':<8} {'MODEL':<15} {'SERIAL':<17} {'WEAR':>5} {'ON-Y':>5} {'LEFT-Y':>6} {'SMART':>7}", 'cyan'))
-for name, model, serial, wear, years, remain, health, color, wear_color in disks:
-    row(seg(pad(name, 8), color),
-        seg(f' {pad(model,15)} {pad(serial,17)} '),
+# DEVICE und SMART entfallen. Stattdessen wird der Modellname anhand des
+# SMART-Zustands eingefaerbt. Seriennummern werden niemals abgekuerzt.
+# Freie 76 Spalten werden dynamisch zwischen Modell und Seriennummer verteilt.
+SERIAL_WIDTH = max(22, *(len(clean(d[1])) for d in disks))
+MODEL_WIDTH = max(8, TEXT_WIDTH - SERIAL_WIDTH - 20)
+row(seg(f"{'MODEL':<{MODEL_WIDTH}} {'SERIAL':<{SERIAL_WIDTH}} {'WEAR':>5} {'ON-Y':>5} {'LEFT-Y':>6}", 'cyan'))
+for model, serial, wear, years, remain, health_color, wear_color in disks:
+    row(
+        seg(pad(model, MODEL_WIDTH), health_color),
+        seg(f' {clean(serial):<{SERIAL_WIDTH}} '),
         seg(f'{wear:>5}', wear_color),
-        seg(f' {years:>5} {remain:>6} '),
-        seg(f'{health:>7}', 'red' if health == 'BAD' else 'orange' if health == 'UNKNOWN' else 'green'),
-        )
-    if len(serial) > 17:
-        row(f'Full serial {name}: {serial}')
+        seg(f' {years:>5} {remain:>6}')
+    )
 if not disks:
     row(seg('Keine physischen Datentraeger erkannt', 'orange'))
 ROWS.append(('footer', f' {host} | Proxmox VE {version} | {now} '))
