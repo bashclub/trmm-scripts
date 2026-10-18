@@ -683,6 +683,13 @@ checkmk_total, checkmk_ok, checkmk_bad, checkmk_text, checkmk_color = checkmk_lo
 # Lifetime estimate assumes the same wear-per-power-on-hour rate continues.
 # It estimates remaining *write endurance*, NOT hardware failure time.
 def smart_values(data):
+    # HPE VK1920GFLKL / SK hynix SE3010:
+    # Die smartmontools-Datenbank kennt diese SSD nicht und meldet
+    # SMART 231 als Unknown_SSD_Attribute. Hier steht der normierte
+    # Wert (VALUE) fuer die verbleibende Schreib-Lebensdauer.
+    # Die Ausnahme ist absichtlich auf das verifizierte Modell begrenzt.
+    model = str(data.get('model_name') or '').strip().upper()
+    known_hpe_231_life_left = model == 'VK1920GFLKL'
     nvme = data.get('nvme_smart_health_information_log') or {}
     hours = number(nvme.get('power_on_hours'))
     wear = number(nvme.get('percentage_used'))
@@ -708,8 +715,19 @@ def smart_values(data):
                 elif aid == 177 and 'wear_level' in name:
                     if norm is not None and 0 <= norm <= 100:
                         wear = 100 - norm
-                elif aid == 231 and any(t in name for t in ('life_left', 'lifetime_remain', 'ssd_life')):
-                    if norm is not None and 0 <= norm <= 100:
+                elif aid == 231:
+                    named_life_left = any(
+                        t in name for t in ('life_left', 'lifetime_remain', 'ssd_life')
+                    )
+                    # Nur fuer diese HPE-SSD darf 'Unknown_SSD_Attribute'
+                    # anhand des bekannten Modells als Life Left gelten.
+                    hpe_unknown = (
+                        known_hpe_231_life_left
+                        and name == 'unknown_ssd_attribute'
+                        and raw is not None and norm is not None
+                        and int(raw) == int(norm)
+                    )
+                    if (named_life_left or hpe_unknown) and norm is not None and 0 <= norm <= 100:
                         wear = 100 - norm
                 elif aid == 202 and 'lifetime' in name:
                     if 'used' in name and raw is not None and 0 <= raw <= 100:
