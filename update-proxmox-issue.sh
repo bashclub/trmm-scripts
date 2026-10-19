@@ -95,7 +95,7 @@ def color_status(text):
     return 'red'
 
 # Utilization thresholds, applied uniformly to used capacity, load and wear.
-# Where a percentage means FREE (RAM, datastores), first invert it.
+# RAM reports free %, while datastores and ZFS report used %.
 def utilization_color(used_pct):
     if used_pct is None:
         return 'orange'
@@ -241,10 +241,113 @@ try:
 except OSError:
     load_text, load_color = 'UNKNOWN', 'orange'
 
-# IP addresses; Linux bridges with host-facing LAN count as physical.
+# IP addresses: identify VPN devices by kernel/netlink type, not name alone.
+# A WireGuard device can be named "sysops", and an OpenVPN TUN device can be
+# named "customer-vpn". Both belong to the virtual network interfaces.
 VIRTUAL_PREFIXES = ('docker', 'br-', 'wg', 'tailscale', 'tun', 'tap', 'veth',
                     'virbr', 'zt', 'vxlan', 'flannel', 'cni', 'podman',
                     'kube', 'dummy', 'gre', 'gretap', 'ip6gre', 'ipip')
+
+
+def vpn_device_types():
+    """Discover WireGuard and TUN/TAP interfaces independently of their names."""
+    detected = {}
+    extended = read_json(['ip', '-d', '-j', 'link', 'show'], timeout=6)
+    if isinstance(extended, list):
+        for entry in extended:
+            name = entry.get('ifname', '')
+            linkinfo = entry.get('linkinfo') or {}
+            kind = str(linkinfo.get('info_kind') or '').lower()
+            if name and kind in ('wireguard', 'tun', 'tap'):
+                detected[name] = ('wg' if kind == 'wireguard' else kind)
+
+    # Reliable for custom WireGuard interface names such as "sysops".
+    rc, output = run(['wg', 'show', 'interfaces'], timeout=5)
+    if rc == 0:
+        for name in output.split():
+            detected[name] = 'wg'
+
+    # Supplement netlink for OpenVPN-style TUN/TAP devices.
+    rc, output = run(['ip', 'tuntap', 'show'], timeout=5)
+    if rc == 0:
+        for line in output.splitlines():
+            match = re.match(r'^([^:]+):\s+(tun|tap)\b', line)
+            if match and detected.get(match.group(1)) != 'wg':
+                detected[match.group(1)] = match.group(2)
+
+    return detected
+
+
+def openvpn_interface_hints():
+    """Associate TUN/TAP devices with OpenVPN when its process names them.
+
+    A generic TUN device is not necessarily OpenVPN (could be another VPN).
+    """
+    explicit = set()
+    generic_types = set()
+    rc, output = run(['pgrep', '-x', 'openvpn'], timeout=3)
+    if rc != 0:
+        return explicit, generic_types
+
+    for pid in output.splitlines():
+        if not pid.isdecimal():
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as proc_cmdline:
+                args = [arg.decode('utf-8', 'replace') for arg in
+                        proc_cmdline.read().split(b'\0') if arg]
+        except OSError:
+            continue
+        paths = []
+        devices = []
+        for i, token in enumerate(args):
+            if token in ('--dev', '--config') and i + 1 < len(args):
+                (devices if token == '--dev' else paths).append(args[i + 1])
+            elif token.startswith('--dev='):
+                devices.append(token.split('=', 1)[1])
+            elif token.startswith('--config='):
+                paths.append(token.split('=', 1)[1])
+        for config_path in paths:
+            try:
+                with open(config_path, encoding='utf-8', errors='replace') as config:
+                    for line in config:
+                        match = re.match(r'^\s*dev\s+([^\s#;]+)', line)
+                        if match:
+                            devices.append(match.group(1).strip('"\''))
+            except OSError:
+                pass
+        for device in devices:
+            if device in ('tun', 'tap'):
+                generic_types.add(device)
+            elif device:
+                explicit.add(device)
+
+    return explicit, generic_types
+
+
+VPN_TYPES = vpn_device_types()
+OPENVPN_EXPLICIT, OPENVPN_GENERIC = openvpn_interface_hints()
+TUN_CANDIDATES = {
+    name for name, kind in VPN_TYPES.items() if kind in ('tun', 'tap')
+}
+# If a single TUN/TAP device and a matching generic OpenVPN daemon exist,
+# association is plausible. Multiple devices remain labeled TUN/TAP unless
+# an explicit dev name was found, avoiding false positive OpenVPN labels.
+if len(TUN_CANDIDATES) == 1:
+    candidate = next(iter(TUN_CANDIDATES))
+    if VPN_TYPES[candidate] in OPENVPN_GENERIC:
+        OPENVPN_EXPLICIT.add(candidate)
+
+
+def vpn_label(name):
+    kind = VPN_TYPES.get(name)
+    if kind == 'wg':
+        return 'WG'
+    if kind in ('tun', 'tap'):
+        return 'OpenVPN' if name in OPENVPN_EXPLICIT else kind.upper()
+    return ''
+
+
 def physical_underlay(name, visited=None):
     if visited is None:
         visited = set()
@@ -261,28 +364,80 @@ def physical_underlay(name, visited=None):
         children = []
     return any(physical_underlay(child, visited) for child in children)
 
+
 def is_physical_ip(name):
+    if name in VPN_TYPES:
+        return False
     lower = name.lower()
     if lower.startswith(VIRTUAL_PREFIXES):
         return False
     return physical_underlay(name) or lower.startswith(('vmbr', 'bond'))
 
-physical_ips, virtual_ips = [], []
+
+physical_ips, virtual_ips, tunnel_ips = [], [], []
 ip_data = read_json(['ip', '-j', 'addr', 'show'])
-if isinstance(ip_data, list):
-    for iface in ip_data:
-        name = iface.get('ifname', '')
-        if not name or name == 'lo':
+if not isinstance(ip_data, list):
+    ip_data = []
+
+# Preserve the interface status/IPs so VPN status can be shown separately.
+iface_data = {entry.get('ifname'): entry for entry in ip_data
+              if isinstance(entry, dict) and entry.get('ifname')}
+
+for iface in ip_data:
+    name = iface.get('ifname', '')
+    if not name or name == 'lo':
+        continue
+    for addr in iface.get('addr_info', []):
+        if addr.get('family') not in ('inet', 'inet6') or addr.get('scope') != 'global':
             continue
-        for addr in iface.get('addr_info', []):
-            if addr.get('family') not in ('inet', 'inet6') or addr.get('scope') != 'global':
-                continue
-            ip = addr.get('local')
-            if ip:
-                entry = f"{ip}/{addr.get('prefixlen', '?')}({name})"
-                (physical_ips if is_physical_ip(name) else virtual_ips).append(entry)
+        ip = addr.get('local')
+        if ip:
+            suffix = f'/{vpn_label(name)}' if vpn_label(name) else ''
+            entry = f"{ip}/{addr.get('prefixlen', '?')}({name}{suffix})"
+            if name in VPN_TYPES:
+                tunnel_ips.append(entry)
+            elif is_physical_ip(name):
+                physical_ips.append(entry)
+            else:
+                virtual_ips.append(entry)
+
 physical_ips = list(dict.fromkeys(physical_ips))
 virtual_ips = list(dict.fromkeys(virtual_ips))
+tunnel_ips = list(dict.fromkeys(tunnel_ips))
+
+
+def vpn_link_up(name):
+    iface = iface_data.get(name) or {}
+    flags = iface.get('flags') or []
+    if flags:
+        return 'UP' in flags
+    try:
+        # IFF_UP (0x1) indicates administrative interface state.
+        with open(f'/sys/class/net/{name}/flags') as file:
+            return bool(int(file.read().strip(), 16) & 1)
+    except (OSError, ValueError):
+        return None
+
+
+vpn_connections = []
+for vpn_name, kind in sorted(VPN_TYPES.items()):
+    if vpn_name not in iface_data:
+        continue
+    link_up = vpn_link_up(vpn_name)
+    state = 'UP' if link_up is True else 'DOWN' if link_up is False else 'UNKNOWN'
+    color = 'green' if link_up is True else 'orange' if link_up is None else 'red'
+    addresses = [f"{item.get('local')}/{item.get('prefixlen')}"
+                 for item in iface_data[vpn_name].get('addr_info', [])
+                 if item.get('scope') == 'global' and item.get('local')]
+    details = f', {", ".join(addresses)}' if addresses else ''
+    peers = ''
+    if kind == 'wg':
+        rc, out = run(['wg', 'show', vpn_name, 'peers'], timeout=4)
+        if rc == 0:
+            peers = f', {len(out.splitlines()) if out else 0} Peers'
+    vpn_connections.append((
+        f'{vpn_label(vpn_name)} {vpn_name}[{state}{details}{peers}]', color
+    ))
 
 # Physical NICs
 nics = []
@@ -348,7 +503,7 @@ def get_guests(command, container=False):
 vms = get_guests(['qm', 'list'])
 lxcs = get_guests(['pct', 'list'], container=True)
 
-# Storage: show actual AVAILABLE GiB and available percentage.
+# Datastores: show USED percentage (not free percentage).
 # pvesm status columns: Name Type Status Total Used Available %
 storages = []
 rc, storage_output = run(['pvesm', 'status'], timeout=12)
@@ -358,21 +513,21 @@ if rc == 0:
         if len(fields) < 3:
             continue
         if fields[2] != 'active' or len(fields) < 7:
-            storages.append((fields[0], '-', 'OFF', 'red'))
+            storages.append((fields[0], 'OFF', 'red'))
             continue
-        available_kib = number(fields[5])
         total_kib = number(fields[3])
+        used_kib = number(fields[4])
+        available_kib = number(fields[5])
         used_pct = number(fields[6])
-        if total_kib and available_kib is not None:
-            pct = 100 * available_kib / total_kib
-        elif used_pct is not None:
-            pct = 100 - used_pct
-        else:
-            pct = None
-        free_gib = f'{available_kib/1048576:.1f}' if available_kib is not None else '?'
-        free_pc = f'{pct:.0f}%' if pct is not None else '?'
-        color = utilization_color(100 - pct if pct is not None else None)
-        storages.append((fields[0], free_gib, free_pc, color))
+        if used_pct is None and total_kib:
+            if used_kib is not None:
+                used_pct = 100.0 * used_kib / total_kib
+            elif available_kib is not None:
+                used_pct = 100.0 * (total_kib - available_kib) / total_kib
+        # pvesm already reports the used percentage; keep its value.
+        used_text = f'{used_pct:.0f}%' if used_pct is not None else '?'
+        color = utilization_color(used_pct)
+        storages.append((fields[0], used_text, color))
 
 # ZFS: over 80% used is red; active scrub/resilver/trim also red.
 zpools, zfs_jobs, zfs_warnings = [], [], []
@@ -810,14 +965,15 @@ def guests_row(label, guests):
     for i, (name, color) in enumerate(guests):
         if i:
             parts.append(seg(', '))
-        parts.append(seg(name, color))
+        guest_id, separator, guest_name = name.partition(':')
+        # Die VMID/CTID bleibt weiss; nur der Name zeigt den Zustand an.
+        parts.append(seg(guest_id + separator, 'white'))
+        parts.append(seg(guest_name, color))
     if not guests:
         parts.append(seg('-', 'orange'))
     row(*parts)
 
 row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'))
-row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
-row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
 row('Kernel  : ', seg(kernel, 'white'), ' [',
     seg(kernel_status, 'green' if kernel_status == 'OK' else 'orange'
         if kernel_status == 'UNKNOWN' or kernel_status.startswith('REBOOT?') else 'red'),
@@ -834,6 +990,24 @@ for i, (label, color) in enumerate(nics):
         parts.append(seg(', '))
     parts.append(seg(label, color))
 row(*parts) if nics else row('NICs    : -')
+row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
+
+section('VIRTUAL NETWORK INTERFACES')
+row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
+
+# Tunnels are listed LAST, after physical and other virtual interfaces.
+# Device UP does not imply an active VPN handshake or reachable peer.
+if vpn_connections or tunnel_ips:
+    section('VPN TUNNELS')
+    parts = [seg('VPNs    : ')]
+    for index, (label, color) in enumerate(vpn_connections):
+        if index:
+            parts.append(seg(', '))
+        parts.append(seg(label, color))
+    if vpn_connections:
+        row(*parts)
+    else:
+        row('VPNs    : ', seg(', '.join(tunnel_ips), 'cyan'))
 
 section('VIRTUAL MACHINES / CONTAINERS')
 guests_row('VMs', vms)
@@ -859,10 +1033,10 @@ for text, color in ups_lines:
 section('SPOOL CHECKS')
 row('Spool Checks: ', seg(checkmk_text, checkmk_color))
 
-# Datastores: zwei Spalten, kompletter Name + freier Prozentwert.
+# Datastores: zwei Spalten, kompletter Name + belegter Prozentwert.
 # 2 x 38 Zeichen = 76 Zeichen Innenbreite. Sehr lange Namen werden
 # innerhalb IHRER Spalte umgebrochen, niemals mit ~ abgekuerzt.
-section('DATASTORES (FREE%)')
+section('DATASTORES (USED%)')
 STORAGE_COLUMN_GAP = 2
 STORAGE_COLUMN_WIDTH = (TEXT_WIDTH - STORAGE_COLUMN_GAP) // 2
 STORAGE_PERCENT_WIDTH = 5
@@ -873,7 +1047,7 @@ def datastore_cell(index):
     if index >= len(storages):
         return []
 
-    name, _free_gib, free_pc, color = storages[index]
+    name, used_pc, color = storages[index]
     name = clean(name)
     chunks = [
         name[j:j + STORAGE_NAME_WIDTH]
@@ -884,7 +1058,7 @@ def datastore_cell(index):
     # Alle Teilzeilen haben exakt STORAGE_COLUMN_WIDTH Zeichen.
     result = []
     for j, chunk in enumerate(chunks):
-        percentage = free_pc if j == len(chunks) - 1 else ''
+        percentage = used_pc if j == len(chunks) - 1 else ''
         result.append([
             seg(f'{chunk:<{STORAGE_NAME_WIDTH}} '),
             seg(f'{percentage:>{STORAGE_PERCENT_WIDTH}}', color),
@@ -892,7 +1066,7 @@ def datastore_cell(index):
     return result
 
 
-header = f'{"NAME":<{STORAGE_NAME_WIDTH}} {"FREE%":>{STORAGE_PERCENT_WIDTH}}'
+header = f'{"NAME":<{STORAGE_NAME_WIDTH}} {"USED%":>{STORAGE_PERCENT_WIDTH}}'
 row(seg(header, 'cyan'), seg(' ' * STORAGE_COLUMN_GAP), seg(header, 'cyan'))
 
 if not storages:
@@ -924,7 +1098,7 @@ section('PHYSICAL DISKS / SMART / ENDURANCE EST.')
 # DEVICE und SMART entfallen. Stattdessen wird der Modellname anhand des
 # SMART-Zustands eingefaerbt. Seriennummern werden niemals abgekuerzt.
 # Freie 76 Spalten werden dynamisch zwischen Modell und Seriennummer verteilt.
-SERIAL_WIDTH = max(22, *(len(clean(d[1])) for d in disks))
+SERIAL_WIDTH = max([22] + [len(clean(d[1])) for d in disks])
 MODEL_WIDTH = max(8, TEXT_WIDTH - SERIAL_WIDTH - 20)
 row(seg(f"{'MODEL':<{MODEL_WIDTH}} {'SERIAL':<{SERIAL_WIDTH}} {'WEAR':>5} {'ON-Y':>5} {'LEFT-Y':>6}", 'cyan'))
 for model, serial, wear, years, remain, health_color, wear_color in disks:
