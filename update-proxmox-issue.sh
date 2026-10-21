@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Proxmox VE Login Banner - Norton Commander Style
-# Default: ANSI blue /etc/motd ONLY (no pre-login disclosure)
-# Options: --mono --issue --no-issue --no-motd
+# Proxmox VE Login Banner - configurable color themes
+# Default: dark mode, /etc/motd ONLY (no pre-login disclosure)
+# Themes: --norton (blue), --paradroid (light gray), --mono (ASCII)
+# Other options: --issue --no-issue --no-motd
 set -euo pipefail
 if (( EUID != 0 )); then
     printf 'Bitte als root ausfuehren.\n' >&2
@@ -22,8 +23,14 @@ from datetime import datetime
 # Einheitliche APT-/CLI-Ausgaben auch bei deutscher System-Locale.
 os.environ['LC_ALL'] = 'C'
 
-parser = argparse.ArgumentParser(description='Proxmox VE Norton Commander Login Banner')
-parser.add_argument('--mono', action='store_true', help='ASCII ohne Farbe')
+parser = argparse.ArgumentParser(description='Proxmox VE Login Banner mit Farbschemata')
+theme_group = parser.add_mutually_exclusive_group()
+theme_group.add_argument('--mono', action='store_true',
+                         help='ASCII ohne Farbe (keine ANSI-Sequenzen)')
+theme_group.add_argument('--norton', action='store_true',
+                         help='Norton-Commander-Farben: blauer Hintergrund')
+theme_group.add_argument('--paradroid', action='store_true',
+                         help='Paradroid-Farben: hellgrauer Hintergrund')
 issue_group = parser.add_mutually_exclusive_group()
 issue_group.add_argument('--issue', action='store_true',
                          help='/etc/issue ausdruecklich zusaetzlich beschreiben')
@@ -38,15 +45,40 @@ WIDTH = 76
 # No traffic-light glyphs: the full inner width is usable.
 TEXT_WIDTH = WIDTH
 RESET = '\033[0m'
-COLORS = {
-    'normal': '\033[44;97m',
-    'white': '\033[1;44;97m',
-    'yellow': '\033[1;44;93m',
-    'cyan': '\033[1;44;96m',
-    'green': '\033[1;44;92m',
-    'red': '\033[1;44;91m',
-    'orange': '\033[1;38;5;208;44m',
+# Jede Farbdefinition enthaelt sowohl Vorder- als auch Hintergrundfarbe.
+# So bleiben auch nach Zeilenumbruechen und in SSH-Terminals die Flaechen
+# durchgaengig einheitlich. '--mono' ignoriert diese ANSI-Farbpaletten.
+COLOR_SCHEMES = {
+    'dark': {
+        'normal': '\033[0;38;5;252;48;5;235m',
+        'white':  '\033[1;38;5;255;48;5;235m',
+        'yellow': '\033[1;38;5;180;48;5;235m',
+        'cyan':   '\033[1;38;5;117;48;5;235m',
+        'green':  '\033[1;38;5;114;48;5;235m',
+        'red':    '\033[1;38;5;203;48;5;235m',
+        'orange': '\033[1;38;5;215;48;5;235m',
+    },
+    'norton': {
+        'normal': '\033[44;97m',
+        'white':  '\033[1;44;97m',
+        'yellow': '\033[1;44;93m',
+        'cyan':   '\033[1;44;96m',
+        'green':  '\033[1;44;92m',
+        'red':    '\033[1;44;91m',
+        'orange': '\033[1;38;5;208;44m',
+    },
+    'paradroid': {
+        'normal': '\033[0;38;5;235;48;5;252m',
+        'white':  '\033[1;38;5;232;48;5;252m',
+        'yellow': '\033[1;38;5;238;48;5;252m',
+        'cyan':   '\033[1;38;5;25;48;5;252m',
+        'green':  '\033[1;38;5;28;48;5;252m',
+        'red':    '\033[1;38;5;160;48;5;252m',
+        'orange': '\033[1;38;5;130;48;5;252m',
+    },
 }
+THEME = 'norton' if args.norton else 'paradroid' if args.paradroid else 'dark'
+COLORS = COLOR_SCHEMES[THEME]
 
 def run(command, timeout=8):
     if not shutil.which(command[0]):
@@ -94,8 +126,7 @@ def color_status(text):
         return 'orange'
     return 'red'
 
-# Utilization thresholds, applied uniformly to used capacity, load and wear.
-# RAM reports free %, while datastores and ZFS report used %.
+# Utilization thresholds, applied uniformly to USED capacity, load and wear.
 def utilization_color(used_pct):
     if used_pct is None:
         return 'orange'
@@ -224,128 +255,30 @@ except OSError:
     pass
 mtotal = mem.get('MemTotal', 0)
 mfree = mem.get('MemAvailable', mem.get('MemFree', 0))
-free_pct = mfree * 100 / mtotal if mtotal else None
-mem_text = (f'{mfree/1048576:.1f} / {mtotal/1048576:.1f} GiB frei '
-            f'({free_pct:.1f}%)') if free_pct is not None else 'UNKNOWN'
-mem_color = utilization_color(100 - free_pct if free_pct is not None else None)
+used_kib = max(0, mtotal - mfree)
+used_pct = used_kib * 100 / mtotal if mtotal else None
+# Die Schreibweise ist kompakt genug fuer RAM, Cores und Load in EINER Zeile.
+mem_text = (f'{used_kib/1048576:.1f}/{mtotal/1048576:.1f}GiB '
+            f'USED {used_pct:.0f}%') if used_pct is not None else 'UNKNOWN'
+mem_color = utilization_color(used_pct)
 
-# Load is normalized load average, not measured CPU utilization.
+# Load Average fuer 1, 5, 15 Minuten, nicht mit CPU-Nutzung verwechseln.
 cores = os.cpu_count() or 1
 try:
     la = os.getloadavg()
-    load_text = '  '.join(
-        f"{f'{n:.1f}'.rstrip('0').rstrip('.').replace('.', ',')}/{cores}"
-        for n in la
+    load_text = ' '.join(
+        f"{minutes}m:{value:.1f}".replace('.', ',')
+        for minutes, value in zip((1, 5, 15), la)
     )
     load_color = utilization_color(max(la) * 100 / cores)
 except OSError:
     load_text, load_color = 'UNKNOWN', 'orange'
 
-# IP addresses: identify VPN devices by kernel/netlink type, not name alone.
-# A WireGuard device can be named "sysops", and an OpenVPN TUN device can be
-# named "customer-vpn". Both belong to the virtual network interfaces.
+# IP-Adressen der Host-Netze sowie der virtuellen Interfaces.
+# Keine separate VPN-/TUN-/TAP-Erkennung: ein TAP kann zu einer VM gehoeren.
 VIRTUAL_PREFIXES = ('docker', 'br-', 'wg', 'tailscale', 'tun', 'tap', 'veth',
                     'virbr', 'zt', 'vxlan', 'flannel', 'cni', 'podman',
                     'kube', 'dummy', 'gre', 'gretap', 'ip6gre', 'ipip')
-
-
-def vpn_device_types():
-    """Discover WireGuard and TUN/TAP interfaces independently of their names."""
-    detected = {}
-    extended = read_json(['ip', '-d', '-j', 'link', 'show'], timeout=6)
-    if isinstance(extended, list):
-        for entry in extended:
-            name = entry.get('ifname', '')
-            linkinfo = entry.get('linkinfo') or {}
-            kind = str(linkinfo.get('info_kind') or '').lower()
-            if name and kind in ('wireguard', 'tun', 'tap'):
-                detected[name] = ('wg' if kind == 'wireguard' else kind)
-
-    # Reliable for custom WireGuard interface names such as "sysops".
-    rc, output = run(['wg', 'show', 'interfaces'], timeout=5)
-    if rc == 0:
-        for name in output.split():
-            detected[name] = 'wg'
-
-    # Supplement netlink for OpenVPN-style TUN/TAP devices.
-    rc, output = run(['ip', 'tuntap', 'show'], timeout=5)
-    if rc == 0:
-        for line in output.splitlines():
-            match = re.match(r'^([^:]+):\s+(tun|tap)\b', line)
-            if match and detected.get(match.group(1)) != 'wg':
-                detected[match.group(1)] = match.group(2)
-
-    return detected
-
-
-def openvpn_interface_hints():
-    """Associate TUN/TAP devices with OpenVPN when its process names them.
-
-    A generic TUN device is not necessarily OpenVPN (could be another VPN).
-    """
-    explicit = set()
-    generic_types = set()
-    rc, output = run(['pgrep', '-x', 'openvpn'], timeout=3)
-    if rc != 0:
-        return explicit, generic_types
-
-    for pid in output.splitlines():
-        if not pid.isdecimal():
-            continue
-        try:
-            with open(f'/proc/{pid}/cmdline', 'rb') as proc_cmdline:
-                args = [arg.decode('utf-8', 'replace') for arg in
-                        proc_cmdline.read().split(b'\0') if arg]
-        except OSError:
-            continue
-        paths = []
-        devices = []
-        for i, token in enumerate(args):
-            if token in ('--dev', '--config') and i + 1 < len(args):
-                (devices if token == '--dev' else paths).append(args[i + 1])
-            elif token.startswith('--dev='):
-                devices.append(token.split('=', 1)[1])
-            elif token.startswith('--config='):
-                paths.append(token.split('=', 1)[1])
-        for config_path in paths:
-            try:
-                with open(config_path, encoding='utf-8', errors='replace') as config:
-                    for line in config:
-                        match = re.match(r'^\s*dev\s+([^\s#;]+)', line)
-                        if match:
-                            devices.append(match.group(1).strip('"\''))
-            except OSError:
-                pass
-        for device in devices:
-            if device in ('tun', 'tap'):
-                generic_types.add(device)
-            elif device:
-                explicit.add(device)
-
-    return explicit, generic_types
-
-
-VPN_TYPES = vpn_device_types()
-OPENVPN_EXPLICIT, OPENVPN_GENERIC = openvpn_interface_hints()
-TUN_CANDIDATES = {
-    name for name, kind in VPN_TYPES.items() if kind in ('tun', 'tap')
-}
-# If a single TUN/TAP device and a matching generic OpenVPN daemon exist,
-# association is plausible. Multiple devices remain labeled TUN/TAP unless
-# an explicit dev name was found, avoiding false positive OpenVPN labels.
-if len(TUN_CANDIDATES) == 1:
-    candidate = next(iter(TUN_CANDIDATES))
-    if VPN_TYPES[candidate] in OPENVPN_GENERIC:
-        OPENVPN_EXPLICIT.add(candidate)
-
-
-def vpn_label(name):
-    kind = VPN_TYPES.get(name)
-    if kind == 'wg':
-        return 'WG'
-    if kind in ('tun', 'tap'):
-        return 'OpenVPN' if name in OPENVPN_EXPLICIT else kind.upper()
-    return ''
 
 
 def physical_underlay(name, visited=None):
@@ -366,22 +299,16 @@ def physical_underlay(name, visited=None):
 
 
 def is_physical_ip(name):
-    if name in VPN_TYPES:
-        return False
     lower = name.lower()
     if lower.startswith(VIRTUAL_PREFIXES):
         return False
     return physical_underlay(name) or lower.startswith(('vmbr', 'bond'))
 
 
-physical_ips, virtual_ips, tunnel_ips = [], [], []
+physical_ips, virtual_ips = [], []
 ip_data = read_json(['ip', '-j', 'addr', 'show'])
 if not isinstance(ip_data, list):
     ip_data = []
-
-# Preserve the interface status/IPs so VPN status can be shown separately.
-iface_data = {entry.get('ifname'): entry for entry in ip_data
-              if isinstance(entry, dict) and entry.get('ifname')}
 
 for iface in ip_data:
     name = iface.get('ifname', '')
@@ -392,52 +319,15 @@ for iface in ip_data:
             continue
         ip = addr.get('local')
         if ip:
-            suffix = f'/{vpn_label(name)}' if vpn_label(name) else ''
-            entry = f"{ip}/{addr.get('prefixlen', '?')}({name}{suffix})"
-            if name in VPN_TYPES:
-                tunnel_ips.append(entry)
-            elif is_physical_ip(name):
+            entry = f"{ip}/{addr.get('prefixlen', '?')}({name})"
+            if is_physical_ip(name):
                 physical_ips.append(entry)
             else:
                 virtual_ips.append(entry)
 
 physical_ips = list(dict.fromkeys(physical_ips))
 virtual_ips = list(dict.fromkeys(virtual_ips))
-tunnel_ips = list(dict.fromkeys(tunnel_ips))
 
-
-def vpn_link_up(name):
-    iface = iface_data.get(name) or {}
-    flags = iface.get('flags') or []
-    if flags:
-        return 'UP' in flags
-    try:
-        # IFF_UP (0x1) indicates administrative interface state.
-        with open(f'/sys/class/net/{name}/flags') as file:
-            return bool(int(file.read().strip(), 16) & 1)
-    except (OSError, ValueError):
-        return None
-
-
-vpn_connections = []
-for vpn_name, kind in sorted(VPN_TYPES.items()):
-    if vpn_name not in iface_data:
-        continue
-    link_up = vpn_link_up(vpn_name)
-    state = 'UP' if link_up is True else 'DOWN' if link_up is False else 'UNKNOWN'
-    color = 'green' if link_up is True else 'orange' if link_up is None else 'red'
-    addresses = [f"{item.get('local')}/{item.get('prefixlen')}"
-                 for item in iface_data[vpn_name].get('addr_info', [])
-                 if item.get('scope') == 'global' and item.get('local')]
-    details = f', {", ".join(addresses)}' if addresses else ''
-    peers = ''
-    if kind == 'wg':
-        rc, out = run(['wg', 'show', vpn_name, 'peers'], timeout=4)
-        if rc == 0:
-            peers = f', {len(out.splitlines()) if out else 0} Peers'
-    vpn_connections.append((
-        f'{vpn_label(vpn_name)} {vpn_name}[{state}{details}{peers}]', color
-    ))
 
 # Physical NICs
 nics = []
@@ -448,6 +338,16 @@ except OSError:
 for name in interfaces:
     base = f'/sys/class/net/{name}'
     if not os.path.exists(f'{base}/device'):
+        continue
+    # Nur administrativ hochgefahrene physische NICs anzeigen (IFF_UP).
+    # Eine aktive NIC ohne Carrier bleibt sichtbar und wird als DOWN markiert.
+    try:
+        with open(f'{base}/flags', encoding='ascii') as flags_file:
+            administratively_up = bool(int(flags_file.read().strip(), 16) & 0x1)
+    except (OSError, ValueError):
+        # Unbekannter Administrationsstatus: lieber nicht als aktiv ausgeben.
+        administratively_up = False
+    if not administratively_up:
         continue
     carrier, speed, duplex = None, '?', '?'
     for key in ('carrier', 'speed', 'duplex'):
@@ -484,8 +384,7 @@ for name in interfaces:
     else:
         nics.append((f'{name}[UNKNOWN]', 'yellow'))
 
-# Guests, stopped = orange
-# Each guest name is colored, without an explicit status suffix.
+# Guests, stopped = orange, running = green, VMID/CTID always white.
 def get_guests(command, container=False):
     rc, output = run(command, timeout=10)
     if rc != 0:
@@ -498,7 +397,7 @@ def get_guests(command, container=False):
         name = fields[-1] if container else fields[1]
         status = (fields[1] if container else fields[2]).lower()
         color = 'green' if status == 'running' else 'orange' if status == 'stopped' else 'red'
-        result.append((f'{fields[0]}:{name}', color))
+        result.append((fields[0], name, color))
     return result
 vms = get_guests(['qm', 'list'])
 lxcs = get_guests(['pct', 'list'], container=True)
@@ -512,8 +411,8 @@ if rc == 0:
         fields = line.split()
         if len(fields) < 3:
             continue
-        if fields[2] != 'active' or len(fields) < 7:
-            storages.append((fields[0], 'OFF', 'red'))
+        # Inaktive / deaktivierte Storages vollstaendig ausblenden.
+        if fields[2].lower() != 'active' or len(fields) < 7:
             continue
         total_kib = number(fields[3])
         used_kib = number(fields[4])
@@ -960,18 +859,40 @@ def row(*parts):
     ROWS.append(('row', segments))
 def section(title):
     ROWS.append(('section', clean(title)))
+# Drei exakt ausgerichtete Spalten innerhalb der 76 Zeichen des Fensters.
+# CTID/VMID und Doppelpunkt bleiben weiss, nur Namen werden statusfarbig.
+GUEST_COL_GAP = 2
+GUEST_COL_WIDTH = (TEXT_WIDTH - 2 * GUEST_COL_GAP) // 3  # 24
+GUEST_ID_WIDTH = 6       # Rechtsbuendig: IDs an derselben vertikalen Position.
+GUEST_NAME_WIDTH = GUEST_COL_WIDTH - GUEST_ID_WIDTH
+
+
+def guest_cell(guest):
+    if guest is None:
+        return [seg(' ' * GUEST_COL_WIDTH)]
+    guest_id, guest_name, color = guest
+    guest_id = clean(guest_id)[-(GUEST_ID_WIDTH - 1):]
+    # Namen abschneiden statt umbrechen, damit jeder Gast genau eine Zeile hat.
+    guest_name = clean(guest_name)[:GUEST_NAME_WIDTH]
+    return [
+        seg(f'{guest_id:>{GUEST_ID_WIDTH - 1}}:', 'white'),
+        seg(f'{guest_name:<{GUEST_NAME_WIDTH}}', color)
+    ]
+
+
 def guests_row(label, guests):
-    parts = [seg(f'{label:<8}: ')]
-    for i, (name, color) in enumerate(guests):
-        if i:
-            parts.append(seg(', '))
-        guest_id, separator, guest_name = name.partition(':')
-        # Die VMID/CTID bleibt weiss; nur der Name zeigt den Zustand an.
-        parts.append(seg(guest_id + separator, 'white'))
-        parts.append(seg(guest_name, color))
+    row(seg(f'{label}:', 'cyan'))
     if not guests:
-        parts.append(seg('-', 'orange'))
-    row(*parts)
+        row(seg('  -', 'orange'))
+        return
+    for offset in range(0, len(guests), 3):
+        parts = []
+        for col in range(3):
+            if col:
+                parts.append(seg(' ' * GUEST_COL_GAP))
+            guest = guests[offset + col] if offset + col < len(guests) else None
+            parts.extend(guest_cell(guest))
+        row(*parts)
 
 row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'))
 row('Kernel  : ', seg(kernel, 'white'), ' [',
@@ -980,8 +901,9 @@ row('Kernel  : ', seg(kernel, 'white'), ' [',
     ']  | APT: ', seg(apt_text, apt_color))
 row(f'Uptime  : {uptime}')
 row('Vzdump  : ', seg(vzdump_text, vzdump_color))
-row('Memory  : ', seg(mem_text, mem_color))
-row('CPUs    : ', seg(f'{cores} Kerne', 'white'), ' | Load: ', seg(load_text, load_color))
+row('Memory  : ', seg(mem_text, mem_color),
+    ' | ', seg(f'{cores} Kerne', 'white'),
+    ' | Load ', seg(load_text, load_color))
 
 section('PHYSICAL NETWORK INTERFACES')
 parts = [seg('NICs    : ')]
@@ -994,20 +916,6 @@ row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
 
 section('VIRTUAL NETWORK INTERFACES')
 row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
-
-# Tunnels are listed LAST, after physical and other virtual interfaces.
-# Device UP does not imply an active VPN handshake or reachable peer.
-if vpn_connections or tunnel_ips:
-    section('VPN TUNNELS')
-    parts = [seg('VPNs    : ')]
-    for index, (label, color) in enumerate(vpn_connections):
-        if index:
-            parts.append(seg(', '))
-        parts.append(seg(label, color))
-    if vpn_connections:
-        row(*parts)
-    else:
-        row('VPNs    : ', seg(', '.join(tunnel_ips), 'cyan'))
 
 section('VIRTUAL MACHINES / CONTAINERS')
 guests_row('VMs', vms)
@@ -1033,7 +941,7 @@ for text, color in ups_lines:
 section('SPOOL CHECKS')
 row('Spool Checks: ', seg(checkmk_text, checkmk_color))
 
-# Datastores: zwei Spalten, kompletter Name + belegter Prozentwert.
+# Datastores: zwei Spalten, nur aktive Datastores, voller Name und USED%.
 # 2 x 38 Zeichen = 76 Zeichen Innenbreite. Sehr lange Namen werden
 # innerhalb IHRER Spalte umgebrochen, niemals mit ~ abgekuerzt.
 section('DATASTORES (USED%)')
