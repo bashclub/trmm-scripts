@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Proxmox VE Login Banner - configurable color themes
+# Proxmox VE Login Banner - revision 2026-10-25-r3
+# NICs: two columns; load: 80/90 percent of cores; VMs: 3, LXCs: 2 columns
 # Default: dark mode, /etc/motd ONLY (no pre-login disclosure)
 # Themes: --norton (blue), --paradroid (light gray), --mono (ASCII)
 # Other options: --issue --no-issue --no-motd
@@ -264,15 +265,22 @@ mem_color = utilization_color(used_pct)
 
 # Load Average fuer 1, 5, 15 Minuten, nicht mit CPU-Nutzung verwechseln.
 cores = os.cpu_count() or 1
+def load_status_color(value, logical_cores):
+    """Green below 80%, orange through 90%, red above 90% of CPU cores."""
+    if value is None:
+        return 'orange'
+    percentage = 100.0 * value / max(1, logical_cores)
+    if percentage > 90:
+        return 'red'
+    if percentage >= 80:
+        return 'orange'
+    return 'green'
+
+
 try:
-    la = os.getloadavg()
-    load_text = ' '.join(
-        f"{minutes}m:{value:.1f}".replace('.', ',')
-        for minutes, value in zip((1, 5, 15), la)
-    )
-    load_color = utilization_color(max(la) * 100 / cores)
+    load_averages = os.getloadavg()
 except OSError:
-    load_text, load_color = 'UNKNOWN', 'orange'
+    load_averages = (None, None, None)
 
 # IP-Adressen der Host-Netze sowie der virtuellen Interfaces.
 # Keine separate VPN-/TUN-/TAP-Erkennung: ein TAP kann zu einer VM gehoeren.
@@ -329,27 +337,52 @@ physical_ips = list(dict.fromkeys(physical_ips))
 virtual_ips = list(dict.fromkeys(virtual_ips))
 
 
-# Physical NICs
+# Physical NICs: nur administrativ aktive Schnittstellen (IFF_UP).
+# Die maximal unterstuetzte Link-Geschwindigkeit ermitteln wir aus den
+# ethtool-Supported-Link-Modes, nicht aus dem ausgehandelten aktuellen Wert.
+def nic_link_speeds(ethtool_output):
+    """Gibt die maximale in ethtool beworbene Full-Duplex-Geschwindigkeit zurueck."""
+    supported = []
+    in_modes = False
+    for line in ethtool_output.splitlines():
+        if re.match(r'^\s*Supported link modes\s*:', line, re.I):
+            in_modes = True
+            line = line.split(':', 1)[1]
+        elif in_modes and re.match(r'^\s+[A-Za-z][A-Za-z -]*:', line):
+            break
+        elif not in_modes:
+            continue
+        for rate, duplex_mode in re.findall(r'(\d+)base[\w/.-]*?/(Full|Half)', line, re.I):
+            if duplex_mode.lower() == 'full':
+                supported.append(int(rate))
+    return max(supported) if supported else None
+
+
+def nic_speed_text(mbps):
+    if mbps is None:
+        return '?'
+    return f'{mbps/1000:g}G' if mbps >= 1000 else f'{mbps}M'
+
+
 nics = []
 try:
     interfaces = sorted(os.listdir('/sys/class/net'))
 except OSError:
     interfaces = []
+
 for name in interfaces:
     base = f'/sys/class/net/{name}'
     if not os.path.exists(f'{base}/device'):
         continue
-    # Nur administrativ hochgefahrene physische NICs anzeigen (IFF_UP).
-    # Eine aktive NIC ohne Carrier bleibt sichtbar und wird als DOWN markiert.
     try:
         with open(f'{base}/flags', encoding='ascii') as flags_file:
             administratively_up = bool(int(flags_file.read().strip(), 16) & 0x1)
     except (OSError, ValueError):
-        # Unbekannter Administrationsstatus: lieber nicht als aktiv ausgeben.
         administratively_up = False
     if not administratively_up:
         continue
-    carrier, speed, duplex = None, '?', '?'
+
+    carrier, speed_mbps, duplex = None, None, '?'
     for key in ('carrier', 'speed', 'duplex'):
         try:
             with open(f'{base}/{key}') as f:
@@ -359,32 +392,71 @@ for name in interfaces:
             elif key == 'speed':
                 mb = int(value)
                 if 0 < mb < 1000000:
-                    speed = f'{mb/1000:g}G' if mb >= 1000 else f'{mb}M'
+                    speed_mbps = mb
             else:
                 duplex = value.upper()
         except (OSError, ValueError):
             pass
-    if carrier is None or speed == '?':
-        _, eth = run(['ethtool', name], timeout=3)
+
+    # ethtool liefert sowohl den ausgehandelten Speed als auch die unterstuetzten
+    # Link-Modi. Fehlen die Angaben, nicht grundlos eine Warnung ausloesen.
+    _, eth = run(['ethtool', name], timeout=3)
+    if carrier is None:
         if 'Link detected: yes' in eth:
             carrier = '1'
         elif 'Link detected: no' in eth:
             carrier = '0'
-        m = re.search(r'Speed:\s*(\d+)Mb/s', eth)
+    if speed_mbps is None:
+        m = re.search(r'^\s*Speed:\s*(\d+)Mb/s', eth, re.M)
         if m:
-            mb = int(m.group(1))
-            speed = f'{mb/1000:g}G' if mb >= 1000 else f'{mb}M'
-        m = re.search(r'Duplex:\s*(\w+)', eth)
+            speed_mbps = int(m.group(1))
+    if duplex == '?':
+        m = re.search(r'^\s*Duplex:\s*(\w+)', eth, re.M)
         if m:
             duplex = m.group(1).upper()
-    if carrier == '1':
-        nics.append((f'{name}[UP {speed}/{duplex}]', 'green'))
-    elif carrier == '0':
-        nics.append((f'{name}[DOWN]', 'red'))
-    else:
-        nics.append((f'{name}[UNKNOWN]', 'yellow'))
 
-# Guests, stopped = orange, running = green, VMID/CTID always white.
+    max_speed_mbps = nic_link_speeds(eth)
+    reduced_speed = (
+        carrier == '1' and (
+            (speed_mbps is not None and max_speed_mbps is not None
+             and speed_mbps < max_speed_mbps)
+            or duplex == 'HALF'
+        )
+    )
+    if carrier == '0':
+        status, status_color = 'DOWN', 'red'
+        link, link_color = '-', 'red'
+    elif carrier == '1':
+        status = 'UP'
+        status_color = 'orange' if reduced_speed else 'green'
+        link = f'{nic_speed_text(speed_mbps)}/{duplex}'
+        link_color = 'orange' if reduced_speed else 'normal'
+    else:
+        status, status_color = 'UNKNOWN', 'orange'
+        link, link_color = f'{nic_speed_text(speed_mbps)}/{duplex}', 'normal'
+    nics.append((name, status, status_color, link, link_color))
+
+# Guest IDs white, guest names colored by status. LXC hostname can be an FQDN
+# in /etc/pve/lxc/<CTID>.conf; if only a short hostname is configured, use
+# its explicit searchdomain where available (do not assume the node's domain).
+def lxc_hostname_fqdn(ctid, fallback):
+    hostname = fallback
+    domain = ''
+    filename = f'/etc/pve/lxc/{ctid}.conf'
+    try:
+        with open(filename, encoding='utf-8', errors='replace') as config:
+            for line in config:
+                if line.startswith('hostname:'):
+                    hostname = line.partition(':')[2].strip() or hostname
+                elif line.startswith('searchdomain:'):
+                    domain = line.partition(':')[2].strip().split()[0]
+    except OSError:
+        return hostname
+    if hostname and '.' not in hostname and domain:
+        hostname += '.' + domain.lstrip('.')
+    return hostname
+
+
 def get_guests(command, container=False):
     rc, output = run(command, timeout=10)
     if rc != 0:
@@ -395,6 +467,8 @@ def get_guests(command, container=False):
         if len(fields) < 3 or not fields[0].isdigit():
             continue
         name = fields[-1] if container else fields[1]
+        if container:
+            name = lxc_hostname_fqdn(fields[0], name)
         status = (fields[1] if container else fields[2]).lower()
         color = 'green' if status == 'running' else 'orange' if status == 'stopped' else 'red'
         result.append((fields[0], name, color))
@@ -859,39 +933,39 @@ def row(*parts):
     ROWS.append(('row', segments))
 def section(title):
     ROWS.append(('section', clean(title)))
-# Drei exakt ausgerichtete Spalten innerhalb der 76 Zeichen des Fensters.
-# CTID/VMID und Doppelpunkt bleiben weiss, nur Namen werden statusfarbig.
+# VM IDs (3 columns) and CT IDs (2 columns) are right-aligned and white.
+# Only guest names carry their running/stopped/error color. Names are clipped
+# within each cell, never wrapped onto extra rows.
 GUEST_COL_GAP = 2
-GUEST_COL_WIDTH = (TEXT_WIDTH - 2 * GUEST_COL_GAP) // 3  # 24
-GUEST_ID_WIDTH = 6       # Rechtsbuendig: IDs an derselben vertikalen Position.
-GUEST_NAME_WIDTH = GUEST_COL_WIDTH - GUEST_ID_WIDTH
+GUEST_ID_WIDTH = 6
 
 
-def guest_cell(guest):
+def guest_cell(guest, width):
     if guest is None:
-        return [seg(' ' * GUEST_COL_WIDTH)]
-    guest_id, guest_name, color = guest
+        return [seg(' ' * width)]
+    guest_id, guest_name, status_color = guest
+    name_width = width - GUEST_ID_WIDTH
     guest_id = clean(guest_id)[-(GUEST_ID_WIDTH - 1):]
-    # Namen abschneiden statt umbrechen, damit jeder Gast genau eine Zeile hat.
-    guest_name = clean(guest_name)[:GUEST_NAME_WIDTH]
+    guest_name = clean(guest_name)[:name_width]
     return [
         seg(f'{guest_id:>{GUEST_ID_WIDTH - 1}}:', 'white'),
-        seg(f'{guest_name:<{GUEST_NAME_WIDTH}}', color)
+        seg(f'{guest_name:<{name_width}}', status_color),
     ]
 
 
-def guests_row(label, guests):
+def guests_row(label, guests, columns):
     row(seg(f'{label}:', 'cyan'))
     if not guests:
         row(seg('  -', 'orange'))
         return
-    for offset in range(0, len(guests), 3):
+    col_width = (TEXT_WIDTH - (columns - 1) * GUEST_COL_GAP) // columns
+    for offset in range(0, len(guests), columns):
         parts = []
-        for col in range(3):
+        for col in range(columns):
             if col:
                 parts.append(seg(' ' * GUEST_COL_GAP))
             guest = guests[offset + col] if offset + col < len(guests) else None
-            parts.extend(guest_cell(guest))
+            parts.extend(guest_cell(guest, col_width))
         row(*parts)
 
 row(seg(f'PROXMOX VE {version}', 'yellow'), seg(f' | {host}', 'white'))
@@ -901,25 +975,57 @@ row('Kernel  : ', seg(kernel, 'white'), ' [',
     ']  | APT: ', seg(apt_text, apt_color))
 row(f'Uptime  : {uptime}')
 row('Vzdump  : ', seg(vzdump_text, vzdump_color))
+load_parts = []
+for index, (minutes, value) in enumerate(zip((1, 5, 15), load_averages)):
+    if index:
+        load_parts.append(seg(' '))
+    value_text = f'{value:.1f}'.replace('.', ',') if value is not None else '?'
+    load_parts.extend((
+        seg(f'{minutes}m:', 'white'),
+        seg(value_text, load_status_color(value, cores)),
+    ))
 row('Memory  : ', seg(mem_text, mem_color),
-    ' | ', seg(f'{cores} Kerne', 'white'),
-    ' | Load ', seg(load_text, load_color))
+    ' | ', seg(f'{cores} Kerne', 'white'), ' | Load ', *load_parts)
 
 section('PHYSICAL NETWORK INTERFACES')
-parts = [seg('NICs    : ')]
-for i, (label, color) in enumerate(nics):
-    if i:
-        parts.append(seg(', '))
-    parts.append(seg(label, color))
-row(*parts) if nics else row('NICs    : -')
+# Two evenly spaced columns. Interface names always start at the same column.
+NIC_COL_GAP = 2
+NIC_COL_WIDTH = (TEXT_WIDTH - NIC_COL_GAP) // 2
+NIC_NAME_WIDTH = 15
+NIC_STATUS_WIDTH = 7
+NIC_SPEED_WIDTH = NIC_COL_WIDTH - NIC_NAME_WIDTH - NIC_STATUS_WIDTH - 3
+
+
+def nic_cell(nic):
+    if nic is None:
+        return [seg(' ' * NIC_COL_WIDTH)]
+    name, status, status_color, speed, speed_color = nic
+    return [
+        seg(f'{clean(name)[:NIC_NAME_WIDTH]:<{NIC_NAME_WIDTH}}', 'white'),
+        seg(' '),
+        seg(f'{status:<{NIC_STATUS_WIDTH}}', status_color),
+        seg(' '),
+        seg(f'{clean(speed)[:NIC_SPEED_WIDTH]:<{NIC_SPEED_WIDTH}}', speed_color),
+        seg(' '),
+    ]
+
+
+if nics:
+    row(seg('NICs:', 'cyan'))
+    for offset in range(0, len(nics), 2):
+        left_nic = nics[offset]
+        right_nic = nics[offset + 1] if offset + 1 < len(nics) else None
+        row(*(nic_cell(left_nic) + [seg(' ' * NIC_COL_GAP)] + nic_cell(right_nic)))
+else:
+    row('NICs    : -')
 row('IP phys : ', seg(', '.join(physical_ips) or '-', 'cyan'))
 
 section('VIRTUAL NETWORK INTERFACES')
 row('IP virt : ', seg(', '.join(virtual_ips) or '-', 'cyan'))
 
 section('VIRTUAL MACHINES / CONTAINERS')
-guests_row('VMs', vms)
-guests_row('LXCs', lxcs)
+guests_row('VMs', vms, columns=3)
+guests_row('LXCs', lxcs, columns=2)
 section('CLUSTER / CEPH / MULTIPATH')
 row(
     'Cluster : ',
@@ -956,6 +1062,11 @@ def datastore_cell(index):
         return []
 
     name, used_pc, color = storages[index]
+    # Belegungswarnungen faerben nur den Prozentwert, nicht den Namen.
+    # Ein fehlender/ungueltiger Prozentwert gilt als Fehler: beide rot.
+    name_color = 'red' if used_pc == '?' else 'white'
+    if used_pc == '?':
+        color = 'red'
     name = clean(name)
     chunks = [
         name[j:j + STORAGE_NAME_WIDTH]
@@ -968,7 +1079,7 @@ def datastore_cell(index):
     for j, chunk in enumerate(chunks):
         percentage = used_pc if j == len(chunks) - 1 else ''
         result.append([
-            seg(f'{chunk:<{STORAGE_NAME_WIDTH}} '),
+            seg(f'{chunk:<{STORAGE_NAME_WIDTH}} ', name_color),
             seg(f'{percentage:>{STORAGE_PERCENT_WIDTH}}', color),
         ])
     return result
@@ -996,7 +1107,12 @@ row(seg(f"{'POOL':<24} {'STATE':<12} {'USED%':>6}", 'cyan'))
 if not zpools:
     row('Keine ZFS-Pools ermittelt')
 for name, health, used, color in zpools:
-    row(seg(f'{pad(name, 24)} '), seg(f'{health:<12} {used:>6}', color))
+    has_error = health.upper() != 'ONLINE' or number(used) is None
+    row(
+        seg(f'{pad(name, 24)} ', 'red' if has_error else 'white'),
+        seg(f'{health:<12} ', 'red' if has_error else 'green'),
+        seg(f'{used:>6}', 'red' if has_error else color),
+    )
 for item in zfs_jobs:
     row('ZFS JOB : ', seg(item, 'red'))
 for item in zfs_warnings:
