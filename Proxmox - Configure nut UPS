@@ -1,0 +1,247 @@
+#!/bin/bash
+#
+# NUT (Network UPS Tools) in einem Schritt einrichten, z. B. auf Proxmox-Hosts
+# bei Kunden. Zwei Fälle:
+#
+#   USV hängt per USB an diesem Host (standalone bzw. netserver):
+#     nut-setup.sh [--name ups] [--listen 192.168.140.241[,…]] [--shutdown-after 300]
+#   Dieser Host hat keine USV, eine andere Maschine stellt sie im Netz bereit (netclient):
+#     nut-setup.sh --client 192.168.140.241 --password <pw> [--user upsremote] [--name ups]
+#
+# Was passiert (Server):
+#   - Pakete nut-server, nut-client; USV per nut-scanner -U suchen (genau eine USB-USV)
+#   - ups.conf [<name>] mit Treiber, vendorid/productid aus dem Scan
+#   - upsd lauscht immer auf 127.0.0.1 und ::1 (Checkmk-Plugin und upsmon fragen
+#     ups@localhost), mit --listen zusätzlich auf diesen Adressen für Clients
+#   - upsd.users: upsmon (primary, lokal) und mit --listen upsremote (secondary)
+#     Kennwörter zufällig; vorhandene werden bei erneutem Lauf weiterverwendet,
+#     damit eingerichtete Clients nicht ausfallen
+#   - upsmon schützt diesen Host: Herunterfahren bei "Akku schwach" (LB), mit
+#     --shutdown-after <s> schon nach <s> Sekunden auf Akku (upssched)
+#   - Dienste aktivieren, Test mit upsc; vorher Sicherung /etc/nut.vor-nut-setup-<Zeit>
+#
+# Proxmox fährt beim Herunterfahren die Gäste über pve-guests sauber herunter.
+# Erneut ausführen ist gefahrlos (überschreibt die Konfiguration, behält Kennwörter).
+#
+# Tactical RMM: als Linux-Skript (Shell bash) anlegen, Optionen unter "Script Arguments",
+# Timeout 300 s. Läuft ohne Rückfragen; Exit-Code 0 = eingerichtet und upsc liefert Daten.
+# Kennwörter werden nicht ausgegeben (sonst stünden sie im Skriptverlauf von TRMM),
+# außer mit --show-password.
+#
+# Weitere Optionen: --index <n> (bei mehreren USB-USVs die n-te, ab 1), --dry-run
+# (nichts installieren/starten, Dateien nach $ROOT bzw. ./nut-setup-probe schreiben)
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+name=ups listen="" client="" user="" password="" shutdown_after=0 index="" dry=0 show_pw=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --name) name=$2; shift ;;
+        --listen) listen=$2; shift ;;
+        --client) client=$2; shift ;;
+        --user) user=$2; shift ;;
+        --password) password=$2; shift ;;
+        --shutdown-after) shutdown_after=$2; shift ;;
+        --index) index=$2; shift ;;
+        --dry-run) dry=1 ;;
+        --show-password) show_pw=1 ;;
+        -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
+        *) echo "Unbekannte Option: $1 (--help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+die() { echo "FEHLER: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+[[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "ungültiger Name '$name'"
+[[ $shutdown_after =~ ^[0-9]+$ ]] || die "--shutdown-after braucht Sekunden"
+(( dry )) || [[ $EUID -eq 0 ]] || die "bitte als root ausführen"
+
+ROOT="${ROOT:-}"
+(( dry )) && ROOT="${ROOT:-$PWD/nut-setup-probe}"
+etc="$ROOT/etc/nut"
+run() { if (( dry )); then echo "(Probelauf) $*"; else "$@"; fi; }
+
+# Datei schreiben: root:nut, 0640 (Kennwörter)
+put() {
+    local f="$etc/$1"
+    mkdir -p "$etc"
+    cat > "$f"
+    if (( ! dry )); then chown root:nut "$f"; chmod 0640 "$f"; fi
+    log "geschrieben: $f"
+}
+
+# Kennwort aus vorhandener upsd.users übernehmen, sonst neu
+pw_for() {
+    local u=$1 old=""
+    [[ -r $etc/upsd.users ]] && old=$(awk -v u="[$u]" '$0==u{f=1;next} /^\[/{f=0} f && $1=="password"{sub(/^[^=]*=[ \t]*/,""); print; exit}' "$etc/upsd.users")
+    if [[ -n $old ]]; then echo "$old"; else od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; fi
+}
+
+backup() {
+    [[ -d $etc ]] || return 0
+    local b="$ROOT/etc/nut.vor-nut-setup-$(date +%Y%m%d-%H%M%S)"
+    cp -a "$etc" "$b"
+    log "Sicherung: $b"
+}
+
+upsmon_conf() {   # $1 = MONITOR-Zeile
+    cat <<EOF
+# Von nut-setup.sh geschrieben ($(date -I))
+$1
+MINSUPPLIES 1
+SHUTDOWNCMD "/sbin/shutdown -h +0"
+POWERDOWNFLAG /etc/killpower
+FINALDELAY 5
+DEADTIME 25
+NOCOMMWARNTIME 300
+NOTIFYFLAG ONLINE SYSLOG+WALL
+NOTIFYFLAG ONBATT SYSLOG+WALL$( (( shutdown_after > 0 )) && echo "+EXEC")
+NOTIFYFLAG LOWBATT SYSLOG+WALL
+NOTIFYFLAG FSD SYSLOG+WALL
+NOTIFYFLAG COMMOK SYSLOG
+NOTIFYFLAG COMMBAD SYSLOG+WALL
+NOTIFYFLAG SHUTDOWN SYSLOG+WALL
+NOTIFYFLAG REPLBATT SYSLOG+WALL
+NOTIFYFLAG NOCOMM SYSLOG+WALL
+$( (( shutdown_after > 0 )) && echo "NOTIFYCMD /sbin/upssched" )
+EOF
+}
+
+upssched_conf() {
+    (( shutdown_after > 0 )) || return 0
+    put upssched.conf <<EOF
+# Von nut-setup.sh geschrieben: nach ${shutdown_after}s auf Akku herunterfahren
+CMDSCRIPT /usr/local/sbin/nut-upssched-cmd
+PIPEFN /run/nut/upssched.pipe
+LOCKFN /run/nut/upssched.lock
+AT ONBATT * START-TIMER shutdown ${shutdown_after}
+AT ONLINE * CANCEL-TIMER shutdown
+EOF
+    mkdir -p "$ROOT/usr/local/sbin"
+    cat > "$ROOT/usr/local/sbin/nut-upssched-cmd" <<'EOF'
+#!/bin/sh
+# Von nut-setup.sh geschrieben: Timer aus upssched.conf abgelaufen
+case "$1" in
+    shutdown) logger -t upssched "USV: Zeit auf Akku abgelaufen, fahre herunter"; /sbin/upsmon -c fsd ;;
+esac
+EOF
+    chmod 0755 "$ROOT/usr/local/sbin/nut-upssched-cmd"
+}
+
+wait_upsc() {   # $1 = ups@host
+    (( dry )) && return 0
+    local i
+    for i in $(seq 1 30); do
+        if upsc "$1" ups.status >/dev/null 2>&1; then
+            log "$1: $(upsc "$1" ups.status 2>/dev/null), $(upsc "$1" device.mfr 2>/dev/null) $(upsc "$1" device.model 2>/dev/null), Akku $(upsc "$1" battery.charge 2>/dev/null)%"
+            return 0
+        fi
+        sleep 2
+    done
+    die "keine Daten von $1 nach 60 s (journalctl -u nut-server -u 'nut-driver@*' -u nut-monitor)"
+}
+
+# --- Client: USV einer anderen Maschine überwachen -----------------------------
+if [[ -n $client ]]; then
+    user=${user:-upsremote}
+    [[ -n $password ]] || die "--client braucht --password (aus der Ausgabe auf dem USV-Host)"
+    log "Netzclient: $name@$client, Benutzer $user"
+    run apt-get install -y -q nut-client
+    backup
+    put nut.conf <<< "MODE=netclient"
+    upsmon_conf "MONITOR $name@$client 1 $user $password secondary" | put upsmon.conf
+    upssched_conf
+    if (( ! dry )); then
+        systemctl disable --now nut-server.service nut-driver.target 2>/dev/null || true
+        systemctl enable nut-monitor.service >/dev/null
+        systemctl restart nut-monitor.service
+    fi
+    wait_upsc "$name@$client"
+    log "fertig: dieser Host fährt herunter, wenn $name@$client es verlangt"
+    exit 0
+fi
+
+# --- Server: USV am USB --------------------------------------------------------
+log "Pakete"
+run apt-get install -y -q nut-server nut-client
+
+log "USV suchen (nut-scanner -U)"
+scan=$(nut-scanner -U -q 2>/dev/null || true)
+n=$(grep -c '^\[' <<< "$scan" || true)
+[[ $n -gt 0 ]] || die "keine USB-USV gefunden (lsusb; Kabel, ggf. USB-Modus der USV)"
+if [[ $n -gt 1 && -z $index ]]; then
+    echo "$scan" >&2; die "$n USVs gefunden, mit --index <n> eine wählen"
+fi
+index=${index:-1}
+block=$(awk -v n="$index" '/^\[/{i++} i==n' <<< "$scan")
+val() { sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"?([^\"]*)\"?.*/\1/p" <<< "$block" | head -1; }
+driver=$(val driver); vendorid=$(val vendorid); productid=$(val productid); serial=$(val serial); product=$(val product); vendor=$(val vendor)
+[[ -n $driver ]] || die "kein Treiber im Scan: $block"
+log "gefunden: ${vendor:-?} ${product:-?} (${vendorid}:${productid}), Treiber $driver"
+
+backup
+mode=standalone; [[ -n $listen ]] && mode=netserver
+put nut.conf <<< "MODE=$mode"
+put ups.conf <<EOF
+# Von nut-setup.sh geschrieben ($(date -I))
+maxretry = 3
+
+[$name]
+    driver = $driver
+    port = auto
+    vendorid = $vendorid
+    productid = $productid
+$( [[ -n $serial ]] && echo "    serial = \"$serial\"" )
+    desc = "${vendor:-USV} ${product:-}"
+    pollinterval = 15
+EOF
+
+{
+    echo "# Von nut-setup.sh geschrieben ($(date -I)); localhost immer (Checkmk, upsmon)"
+    echo "LISTEN 127.0.0.1 3493"
+    echo "LISTEN ::1 3493"
+    IFS=, read -ra addrs <<< "$listen"
+    for a in "${addrs[@]}"; do if [[ -n $a ]]; then echo "LISTEN $a 3493"; fi; done
+} | put upsd.conf
+
+pw_mon=$(pw_for upsmon)
+pw_remote=""
+[[ -n $listen ]] && pw_remote=$(pw_for upsremote)
+{
+    echo "# Von nut-setup.sh geschrieben ($(date -I))"
+    printf '[upsmon]\n    password = %s\n    upsmon primary\n' "$pw_mon"
+    if [[ -n $pw_remote ]]; then printf '\n[upsremote]\n    password = %s\n    upsmon secondary\n' "$pw_remote"; fi
+} | put upsd.users
+
+upsmon_conf "MONITOR $name@localhost 1 upsmon $pw_mon primary" | put upsmon.conf
+upssched_conf
+
+if (( ! dry )); then
+    log "Dienste"
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb 2>/dev/null || true
+    command -v upsdrvsvcctl >/dev/null && upsdrvsvcctl resync >/dev/null 2>&1 || true
+    systemctl enable nut-server.service nut-monitor.service >/dev/null
+    systemctl enable nut-driver.target >/dev/null 2>&1 || true
+    systemctl restart nut-driver.target 2>/dev/null || systemctl restart "nut-driver@$name.service"
+    systemctl restart nut-server.service
+    systemctl restart nut-monitor.service
+fi
+wait_upsc "$name@localhost"
+if (( ! dry )) && ! systemctl is-active --quiet nut-monitor.service; then
+    die "upsmon läuft nicht (journalctl -u nut-monitor)"
+fi
+
+log "fertig: $name@localhost schützt diesen Host ($mode)"
+if [[ -n $pw_remote ]]; then
+    echo
+    echo "Für Clients im Netz (auf dem Client ausführen):"
+    if (( show_pw )); then
+        echo "  nut-setup.sh --client ${listen%%,*} --name $name --user upsremote --password '$pw_remote'"
+    else
+        echo "  nut-setup.sh --client ${listen%%,*} --name $name --user upsremote --password <Kennwort>"
+        echo "  Kennwort: auf diesem Host in $etc/upsd.users, Abschnitt [upsremote]"
+        echo "  (nicht ausgegeben, damit es nicht im RMM-Verlauf landet; --show-password zeigt es)"
+    fi
+fi
